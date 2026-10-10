@@ -100,9 +100,7 @@ def prepare(path=None, *, frame=None, bg=None, priors=None, per_post=14,
                                  max_cost=5, bgidx=bg)
     dfu = M.sum(1)
     rare = (dfu >= 1) & (dfu <= max(4, int(0.05 * n)))
-    Mr = np.zeros_like(M)
-    Mr[rare] = M[rare]
-    coh = Coherence(Mr)
+    coh = Coherence(M & rare[:, None])
 
     post_terms = data.post_termsets(df)
     post2unit = np.zeros(len(df), dtype=np.int32)

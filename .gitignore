@@ -10,6 +10,9 @@ venv/
 *.db
 *.db-shm
 *.db-wal
+# Persisted Bluesky session (holds a refresh token)
+bsky_session.txt
+bsky_session.txt.tmp
 .env.local
 # Private deployment tooling and notes for the author's own server: kept
 # locally, never published.

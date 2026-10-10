@@ -1,22 +1,11 @@
 """Sanity-check rich-text facet detection (links / mentions / hashtags).
 
-Self-contained: doesn't import server.py (avoids the Bluesky client login on
-import). Mirrors _FACET_URL_RE / _FACET_MENTION_RE / _FACET_TAG_RE /
-_trim_url_match and the byte-offset logic in server.py — if you change them
-there, update this file too. Run: `python _test_facets.py`.
+Runs the real server._detect_facets with a fake handle resolver, so there is
+no copy of the regexes to keep in sync. Run: `python _test_facets.py`.
 
-Facets are represented as plain dicts here; server.py builds the equivalent
-models.AppBskyRichtextFacet objects.
+Facets are flattened to plain dicts for the assertions below.
 """
-import re
-
-_FACET_URL_RE = re.compile(
-    r"https?://[^\s<>\"']+|www\.[^\s<>\"']+|\b[a-z0-9][-a-z0-9.]*\.[a-z]{2,}/[^\s<>\"']*",
-    re.IGNORECASE,
-)
-_FACET_MENTION_RE = re.compile(r"(?<![\w@])@([a-zA-Z0-9][a-zA-Z0-9.-]*\.[a-zA-Z]{2,})")
-_FACET_TAG_RE = re.compile(r"(?<![\w#])#([^\W\d_][\w]*)", re.UNICODE)
-_URL_TRAILING_PUNCT = ".,;:!?'\")]}»…"
+from _test_support import server
 
 # Handles the fake resolver "knows"; anything else fails to resolve.
 _KNOWN_HANDLES = {
@@ -25,54 +14,22 @@ _KNOWN_HANDLES = {
 }
 
 
-def _trim_url_match(url: str) -> str:
-    while url and url[-1] in _URL_TRAILING_PUNCT:
-        if url[-1] == ")" and url.count("(") >= url.count(")"):
-            break
-        url = url[:-1]
-    return url
+def _fake_resolve(handle: str) -> str:
+    return _KNOWN_HANDLES[handle]  # KeyError = unresolvable, like the API failing
 
 
 def _detect_facets(text: str) -> list[dict]:
-    facets: list[dict] = []
-    claimed: list[tuple[int, int]] = []
-
-    def overlaps(start, end):
-        return any(s < end and start < e for s, e in claimed)
-
-    def byte_slice(start, end):
-        return (len(text[:start].encode("utf-8")), len(text[:end].encode("utf-8")))
-
-    for m in _FACET_URL_RE.finditer(text):
-        url = _trim_url_match(m.group(0))
-        if not url:
-            continue
-        start, end = m.start(), m.start() + len(url)
-        uri = url if url.lower().startswith(("http://", "https://")) else f"https://{url}"
-        facets.append({"type": "link", "index": byte_slice(start, end), "uri": uri})
-        claimed.append((start, end))
-
-    for m in _FACET_MENTION_RE.finditer(text):
-        start, end = m.start(), m.end()
-        if overlaps(start, end):
-            continue
-        did = _KNOWN_HANDLES.get(m.group(1))
-        if did is None:
-            continue
-        facets.append({"type": "mention", "index": byte_slice(start, end), "did": did})
-        claimed.append((start, end))
-
-    for m in _FACET_TAG_RE.finditer(text):
-        start, end = m.start(), m.end()
-        if overlaps(start, end):
-            continue
-        tag = m.group(1)
-        if len(tag.encode("utf-8")) > 640:
-            continue
-        facets.append({"type": "tag", "index": byte_slice(start, end), "tag": tag})
-        claimed.append((start, end))
-
-    return facets
+    out = []
+    for facet in server._detect_facets(text, resolve_handle=_fake_resolve) or []:
+        feature = facet.features[0]
+        index = (facet.index.byte_start, facet.index.byte_end)
+        if hasattr(feature, "uri"):
+            out.append({"type": "link", "index": index, "uri": feature.uri})
+        elif hasattr(feature, "did"):
+            out.append({"type": "mention", "index": index, "did": feature.did})
+        else:
+            out.append({"type": "tag", "index": index, "tag": feature.tag})
+    return out
 
 
 def _slice_by_bytes(text: str, index: tuple[int, int]) -> str:

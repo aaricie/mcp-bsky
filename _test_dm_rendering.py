@@ -1,11 +1,12 @@
-"""Self-contained checks for DM reply and shared-post rendering.
+"""Offline checks for DM reply and shared-post rendering (real server.py, no network).
 
 Run: python _test_dm_rendering.py
 """
-import ast
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+
+from _test_support import server
 
 
 class Obj:
@@ -13,24 +14,7 @@ class Obj:
         self.__dict__.update(kwargs)
 
 
-tree = ast.parse((Path(__file__).parent / "server.py").read_text(encoding="utf-8"))
-wanted = {
-    "_truncate", "_get_text", "_get_gallery_items", "_get_embed_info", "_parse_ts",
-    "_dm_sender_label", "_dm_record_view", "_format_dm_shared_post",
-    "_format_dm_reply_context", "_format_message_block",
-}
-body = [
-    node for node in tree.body
-    if isinstance(node, ast.FunctionDef) and node.name in wanted
-]
-missing = wanted - {node.name for node in body}
-assert not missing, f"missing server functions: {sorted(missing)}"
-namespace = {
-    "datetime": datetime,
-    "timezone": timezone,
-    "SimpleNamespace": SimpleNamespace,
-}
-exec(compile(ast.Module(body=body, type_ignores=[]), "server.py", "exec"), namespace)
+namespace = vars(server)
 render = namespace["_format_message_block"]
 
 

@@ -7,8 +7,14 @@
 fastmcp>=4.1,<5
 # >=0.0.72: current chat reply fields/open unions plus gallery post views.
 # Older SDKs either drop DM reply context or fail validation on newer embeds.
-atproto>=0.0.72
-httpx
+# <0.0.73: server.py relies on SDK session internals (_refresh_lock,
+# _should_refresh_session, _refresh_and_set_session) to serialize refreshes
+# across the chat-proxy clones; re-check _ensure_session/_dm before bumping.
+atproto>=0.0.72,<0.0.73
+# _PublicOnlyTransport swaps httpx's connection pool for one with an
+# address-vetting httpcore backend (the SSRF guard); re-verify on upgrade.
+httpx>=0.28,<0.29
+httpcore>=1.0,<2
 python-dotenv
 grapheme
 uvicorn

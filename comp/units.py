@@ -22,12 +22,30 @@ from __future__ import annotations
 import collections
 import urllib.parse as up
 
-_TRACKING = ("utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term",
-             "si", "ref", "ref_src", "s", "cmpid", "smid", "fbclid", "gclid")
+# Parameters that only say where a click came from. Everything else in a query
+# string is presumed to identify the page (?slug=, ?v=, ?id=, ?story_fbid=):
+# dropping an identity parameter merges different articles into one story,
+# while keeping a tracking one only costs a missed merge.
+_TRACKING = frozenset((
+    "si", "ref", "ref_src", "ref_url", "referrer", "src", "source", "s", "cmpid",
+    "smid", "smtyp", "fbclid", "gclid", "dclid", "msclkid", "yclid", "twclid",
+    "igshid", "igsh", "mc_cid", "mc_eid", "mkt_tok", "_hsenc", "_hsmi", "ncid",
+    "ocid", "cid", "sr_share", "share", "feature", "via", "trk", "taid",
+))
+_TRACKING_PREFIXES = ("utm_", "itm_", "pk_", "mtm_", "at_", "__")
+
+
+def _is_tracking(key: str) -> bool:
+    k = key.lower()
+    return k in _TRACKING or k.startswith(_TRACKING_PREFIXES)
 
 
 def canon_url(u: str) -> str | None:
-    """Canonical article identity: host + path, tracking parameters dropped."""
+    """Canonical article identity: host + path + identifying query parameters.
+
+    Known tracking parameters are dropped; unknown ones are kept, sorted, so
+    two URLs differing only in parameter order or click attribution match.
+    """
     if not u:
         return None
     try:
@@ -38,9 +56,7 @@ def canon_url(u: str) -> str | None:
     if not host:
         return None
     path = p.path.rstrip("/")
-    q = [(k, v) for k, v in up.parse_qsl(p.query) if k.lower() not in _TRACKING]
-    # Query strings that carry identity (youtube v=, articles id=) are kept.
-    q = [(k, v) for k, v in q if k.lower() in ("v", "id", "story", "p", "article")]
+    q = [(k, v) for k, v in up.parse_qsl(p.query, keep_blank_values=True) if not _is_tracking(k)]
     tail = ("?" + up.urlencode(sorted(q))) if q else ""
     return f"{host}{path}{tail}"
 

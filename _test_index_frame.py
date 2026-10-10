@@ -5,47 +5,43 @@ SEARCHABLE fields are what Bluesky's own search engine indexes, so a column
 silently dropped or misnamed here produces entries no search can resolve — and
 nothing about the output would look wrong.
 
-So this test uses the real 3,047-post capture as ground truth, reshapes each
-row into an object with the same attribute layout `atproto` gives us
+So this test takes a capture as ground truth, reshapes each row into an
+object with the same attribute layout `atproto` gives us
 (PostView.record.text, .embed.external.title, ...), pushes that through the
-real `_postviews_to_frame` extracted from server.py, and asserts the resulting
-index is IDENTICAL to the one built from the parquet directly.
+real `server._postviews_to_frame`, and asserts the resulting index is
+IDENTICAL to the one built from the capture directly.
 
-Run:  python _test_index_frame.py [path/to/timeline.parquet]
+The default capture is the committed, fully synthetic
+data/fixtures/synthetic_timeline.jsonl (302 posts, regenerate with
+data/fixtures/make_synthetic_timeline.py). A real capture from the compressor
+lab (parquet, e.g. the 3,047-post timeline) can be passed as argv[1] or via
+COMP_TIMELINE_CAPTURE for a stronger check.
+
+Run:  python _test_index_frame.py [path/to/timeline.parquet|.jsonl]
 Needs pandas/numpy/scipy/tiktoken and data/bg/*.pkl.
 """
-import ast
 import os
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
 
-HERE = Path(__file__).parent
-# A timeline capture (parquet) from the compressor lab: pass its path as
-# argv[1] or set COMP_TIMELINE_CAPTURE.
-DEFAULT_CAPTURE = Path(os.environ.get("COMP_TIMELINE_CAPTURE", "data/raw/posts/timeline-00000.parquet"))
+HERE = Path(__file__).resolve().parent
+_ARG = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else None  # before the chdir below
+DEFAULT_CAPTURE = Path(os.environ.get(
+    "COMP_TIMELINE_CAPTURE", HERE / "data" / "fixtures" / "synthetic_timeline.jsonl")).resolve()
 
-# Functions lifted verbatim from server.py — no login, no MCP, no network.
-WANTED = (
-    "_get_text", "_get_gallery_items", "_get_image_alts", "_get_external_embed",
-    "_get_external_url", "_get_external_meta", "_record_tags", "_parse_ts",
-    "_get_feed_item_timestamp", "_postviews_to_frame",
-)
+from _test_support import server  # noqa: E402  (no login, no MCP, no network)
+
+
+def load_capture(path: Path) -> pd.DataFrame:
+    if path.suffix == ".jsonl":
+        return pd.read_json(path, lines=True, dtype=False)
+    return pd.read_parquet(path)
 
 
 def load_server_functions() -> dict:
-    tree = ast.parse((HERE / "server.py").read_text(encoding="utf-8"))
-    wanted = {n for n in WANTED}
-    body = [n for n in tree.body
-            if isinstance(n, ast.FunctionDef) and n.name in wanted]
-    missing = wanted - {n.name for n in body}
-    if missing:
-        raise SystemExit(f"server.py no longer defines: {sorted(missing)}")
-    ns: dict = {"datetime": datetime, "timezone": timezone}
-    exec(compile(ast.Module(body=body, type_ignores=[]), "server.py", "exec"), ns)
-    return ns
+    return vars(server)
 
 
 class Obj:
@@ -119,7 +115,7 @@ def index_entries(frame, bg, priors, budget=400):
 
 
 def main():
-    capture = Path(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_CAPTURE
+    capture = _ARG or DEFAULT_CAPTURE
     if not capture.exists():
         raise SystemExit(f"capture not found: {capture}")
 
@@ -127,7 +123,7 @@ def main():
     from comp.vocab import Priors
     bg, priors = Background(), Priors()
 
-    truth = pd.read_parquet(capture)
+    truth = load_capture(capture)
     ns = load_server_functions()
     rebuilt = ns["_postviews_to_frame"](
         [(row_to_feed_item(r), []) for r in truth.itertuples(index=False)]

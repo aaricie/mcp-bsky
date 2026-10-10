@@ -17,6 +17,8 @@ really is.
 """
 from __future__ import annotations
 
+from datetime import timedelta
+
 from .tok import ntok
 from .vocab import render
 
@@ -24,24 +26,49 @@ from .vocab import render
 # 2% of the artifact. But not terser — the header is the only thing that tells
 # the reader these are queries rather than notes, and getting that wrong wastes
 # far more than it saves.
-# The 'no hits -> drop since' clause costs ~10 tokens and buys back a silent
-# failure: search filters on INDEXING time, but the window is when posts
-# reached the timeline, so a reposted or resurfaced item can sit inside the
-# window and outside the bounds. Measured at <4% of entries (25/25 of one
-# random sample retrieved fine) — but a miss reads as "nobody discussed this",
-# which is the single most expensive way for this artifact to be wrong.
+# The bounds are emitted to the second, ready to paste: rounding a 20-minute
+# window to "0h" (as an earlier version did) points the expansion search at an
+# interval that excludes the very posts that formed the topic. `until` is the
+# newest post + 1 s because searchPostsV2 treats it as exclusive.
+#
+# The fallback clause costs ~20 tokens and buys back two silent failures, each
+# of which reads as "nobody discussed this" — the single most expensive way for
+# this artifact to be wrong:
+#   * search filters on INDEXING time, but the window is when posts reached the
+#     timeline, so a reposted or resurfaced item can sit inside the window and
+#     outside the bounds (measured at <4% of entries);
+#   * `following=1` filters on the AUTHOR, while the home timeline also carries
+#     posts that followed accounts reposted from people the reader does not
+#     follow — those are in the index but outside a following-only search.
 HEADER = (
-    "BSKY-IDX {t0:%Y-%m-%dT%H:%M}Z+{span} {posts}p/{authors}a; {n} topics, "
+    "BSKY-IDX since={since} until={until} ({span}) {posts}p/{authors}a; {n} topics, "
     "biggest first, {unit}-separated. Each IS an AND search query: "
-    "search_posts(q, {scope}since/until above). Fewer terms = wider; no hits "
-    "-> retry without since. get_thread a hit to read the whole conversation."
+    "search_posts(q, {scope}since, until). Fewer terms = wider. No hits -> "
+    "{fallback}. get_thread a hit to read the whole conversation."
 )
 
 # The index is built from one source, but search is global. For the home
-# timeline `following=1` reproduces the scope exactly; for a feed or list
-# nothing does, so the reader is told to expect hits from outside it.
+# timeline `following=1` is the closest approximation (reposts excepted, hence
+# the fallback); for a feed or list nothing reproduces it, so the reader is
+# told to expect hits from outside it.
 SCOPE_FOLLOWING = "following=1, "
 SCOPE_OTHER = ""
+_FALLBACK = {
+    SCOPE_FOLLOWING: "drop following (reposts reach past it), then since/until "
+                     "(search uses indexing time)",
+    SCOPE_OTHER: "drop since/until (search uses indexing time)",
+}
+
+
+def _bound(ts) -> str:
+    return ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _span(seconds: float) -> str:
+    if seconds < 120 * 60:
+        return f"{max(1, round(seconds / 60))}m"
+    h = seconds / 3600.0
+    return f"{h:.1f}h" if h < 48 else f"{h / 24:.1f}d"
 
 
 def encode(chosen, units, window, *, n_posts=0, n_authors=0, header=True,
@@ -51,10 +78,13 @@ def encode(chosen, units, window, *, n_posts=0, n_authors=0, header=True,
     t0, t1 = window
     lines = []
     if header:
-        h = (t1 - t0).total_seconds() / 3600.0
-        span = f"{h:.0f}h" if h < 48 else f"{h/24:.1f}d"
-        head = HEADER.format(t0=t0, span=span, posts=n_posts,
+        since = t0.floor("s") if hasattr(t0, "floor") else t0.replace(microsecond=0)
+        until = (t1.floor("s") if hasattr(t1, "floor") else t1.replace(microsecond=0)) \
+            + timedelta(seconds=1)
+        head = HEADER.format(since=_bound(since), until=_bound(until),
+                             span=_span((t1 - t0).total_seconds()), posts=n_posts,
                              authors=n_authors, n=len(chosen), scope=scope,
+                             fallback=_FALLBACK.get(scope, _FALLBACK[SCOPE_OTHER]),
                              unit="newline" if "\n" in sep else "';'")
         if source_note:
             head += " " + source_note

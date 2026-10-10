@@ -6,7 +6,9 @@ Single file by design; see CLAUDE.md for architecture and deployment notes.
 """
 import asyncio
 import base64
+import contextvars
 import copy
+import hashlib
 import hmac
 import ipaddress
 import json
@@ -17,7 +19,7 @@ import socket
 import sqlite3
 import threading
 from collections import Counter
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Annotated, Literal
@@ -27,8 +29,10 @@ from zoneinfo import ZoneInfo
 import time
 
 import grapheme
+import httpcore
 import httpx
 from atproto import Client, Request as AtprotoRequest, models
+from atproto_client import exceptions as atproto_exc
 from atproto_client.models.utils import get_or_create
 from dotenv import load_dotenv
 from fastmcp import Context, FastMCP
@@ -48,10 +52,16 @@ load_dotenv()
 _TZ_LOCAL = ZoneInfo("America/Toronto")
 
 _POST_ID_TTL = 3600  # seconds — rolling window for get_post_by_id
+# An expired ID stops resolving after _POST_ID_TTL, but its number is not handed
+# to a different post until this much later, so a stale ID in an old chat turn
+# fails loudly instead of silently naming some other post.
+_POST_ID_REUSE_AFTER = max(_POST_ID_TTL, int(float(os.getenv("MCP_POST_ID_REUSE_HOURS", "24")) * 3600))
 
 
-BSKY_HANDLE = os.environ["BSKY_HANDLE"]
-BSKY_APP_PASSWORD = os.environ["BSKY_APP_PASSWORD"]
+# Read here, validated at startup (_require_credentials): importing the module
+# must not need credentials or the network, so tests can import it.
+BSKY_HANDLE = os.getenv("BSKY_HANDLE", "")
+BSKY_APP_PASSWORD = os.getenv("BSKY_APP_PASSWORD", "")
 # PDS / entryway base URL. Accounts hosted on a non-Bluesky PDS must point
 # this at their own PDS, since both the SDK client and the raw XRPC calls
 # below target this host.
@@ -71,54 +81,147 @@ MCP_ALLOWED_GITHUB_IDS = {s.strip() for s in os.getenv("MCP_ALLOWED_GITHUB_IDS",
 MCP_PATH = "/mcp"
 
 # --- Bluesky client ---
+#
+# Nothing here touches the network at import time: _startup() logs in when the
+# server runs, and the _SessionGuard middleware covers a login that failed at
+# startup. That keeps a Bluesky outage from crash-looping
+# the service and lets tests import this module.
 
 client = Client(BSKY_SERVICE, request=AtprotoRequest(
     timeout=HttpxTimeout(connect=5.0, read=15.0, write=10.0, pool=5.0)
 ))
-client.login(BSKY_HANDLE, BSKY_APP_PASSWORD)
+
+# One lock for every session transition — the SDK's own refresh, our raw-XRPC
+# refresh, logins, and the chat-proxy clones. The SDK gives each clone its own
+# _refresh_lock while they all share one session, so concurrent calls could
+# otherwise refresh the same session twice. Reentrant because login() fetches
+# the profile through _invoke, which takes the lock again.
+_session_lock = threading.RLock()
+client._refresh_lock = _session_lock
+
+# Refresh tokens outlive restarts (~2 months); reusing one avoids a fresh
+# createSession, which is rate limited per account, every time the service
+# restarts. Empty disables persistence.
+BSKY_SESSION_FILE = os.getenv("BSKY_SESSION_FILE", "bsky_session.txt")
+
+_LOGIN_MAX_BACKOFF = 300.0
+_login_state = {"retry_at": 0.0, "backoff": 0.0, "error": ""}
 
 # Persistent HTTP client for raw XRPC calls — reuses TCP/TLS connections
 _http = httpx.Client(timeout=30, headers={"User-Agent": "bsky-mcp/1.0"})
 
-# --- Caches ---
 
-feed_cache: dict[str, str] = {}  # name.lower() -> AT URI
-list_cache: dict[str, str] = {}  # name.lower() -> AT URI
+def _require_credentials() -> None:
+    missing = [n for n, v in (("BSKY_HANDLE", BSKY_HANDLE), ("BSKY_APP_PASSWORD", BSKY_APP_PASSWORD)) if not v]
+    if missing:
+        raise SystemExit(f"Set {', '.join(missing)} in .env")
 
 
-def _jwt_exp(token: str) -> float | None:
-    """Decode the exp claim from a JWT without verifying the signature."""
+def _persist_session(_event, session) -> None:
+    if not BSKY_SESSION_FILE:
+        return
     try:
-        payload_b64 = token.split(".")[1]
-        payload_b64 += "=" * (-len(payload_b64) % 4)
-        return float(json.loads(base64.urlsafe_b64decode(payload_b64)).get("exp", 0))
-    except Exception:
+        tmp = BSKY_SESSION_FILE + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(session.export())
+        os.replace(tmp, BSKY_SESSION_FILE)
+    except Exception as exc:
+        log.warning("Could not save the Bluesky session: %s", exc)
+
+
+client.on_session_change(_persist_session)
+
+
+def _read_saved_session() -> str | None:
+    if not BSKY_SESSION_FILE:
+        return None
+    try:
+        with open(BSKY_SESSION_FILE, encoding="utf-8") as f:
+            return f.read().strip() or None
+    except OSError:
         return None
 
 
-def _ensure_session():
-    """Make sure the access token is usable for raw XRPC calls.
+def _session_is_dead(exc: Exception) -> bool:
+    """True when the error proves the session itself is unusable.
 
-    Fast path: if the access JWT is still valid for >60s, do nothing — this
-    avoids a full getProfile round-trip before every raw call. Otherwise an
-    SDK call triggers the SDK's own proactive token refresh; if even that
-    fails, fall back to a fresh login.
+    Only these justify a fresh login. Timeouts, 5xx and network failures are
+    the service's problem, and answering them with createSession would turn an
+    outage into a stream of rate-limited logins while hiding the real fault.
     """
-    session = getattr(client, "_session", None)
-    token = getattr(session, "access_jwt", None) if session else None
-    if token:
-        exp = _jwt_exp(token)
-        if exp and exp - time.time() > 60:
-            return
+    if isinstance(exc, (atproto_exc.LoginRequiredError, atproto_exc.UnauthorizedError)):
+        return True
+    if isinstance(exc, atproto_exc.BadRequestError):
+        content = getattr(getattr(exc, "response", None), "content", None)
+        return getattr(content, "error", None) in ("ExpiredToken", "InvalidToken")
+    return False
+
+
+def _login_locked() -> None:
+    """Password login, with backoff after a failure. Caller holds _session_lock."""
+    now = time.monotonic()
+    if now < _login_state["retry_at"]:
+        raise ToolError(
+            f"Bluesky login failed recently ({_login_state['error']}); "
+            f"next attempt in {int(_login_state['retry_at'] - now) + 1}s."
+        )
     try:
-        client.app.bsky.actor.get_profile({"actor": client.me.handle})
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code in (401, 403):
-            client.login(BSKY_HANDLE, BSKY_APP_PASSWORD)
-        else:
-            raise
-    except Exception:
         client.login(BSKY_HANDLE, BSKY_APP_PASSWORD)
+    except Exception as exc:
+        backoff = min(max(_login_state["backoff"] * 2, 5.0), _LOGIN_MAX_BACKOFF)
+        _login_state.update(retry_at=now + backoff, backoff=backoff, error=_brief_error(exc))
+        raise
+    _login_state.update(retry_at=0.0, backoff=0.0, error="")
+    log.info("Logged in to Bluesky as %s", BSKY_HANDLE)
+
+
+def _sign_in_locked() -> None:
+    """Resume the saved session if it still refreshes, else log in."""
+    saved = _read_saved_session()
+    if saved:
+        try:
+            client.login(session_string=saved)
+            if (client._session.handle or "").lower() == BSKY_HANDLE.lower():
+                log.info("Resumed saved Bluesky session for %s", BSKY_HANDLE)
+                return
+            log.info("Saved session belongs to another account; logging in")
+        except Exception as exc:
+            if not _session_is_dead(exc):
+                raise
+            log.info("Saved session is no longer valid (%s); logging in", _brief_error(exc))
+    _login_locked()
+
+
+def _ensure_logged_in() -> None:
+    """Sign in if no session exists yet (startup login failed or never ran)."""
+    if client.me is not None:
+        return
+    with _session_lock:
+        if client.me is None:
+            _sign_in_locked()
+
+
+def _ensure_session():
+    """Make sure the access token is usable for raw XRPC and chat calls.
+
+    Uses the SDK's own refresh policy (15 minutes before expiry) under the
+    shared session lock, so it never races the SDK's proactive refresh. A
+    rejected refresh token means the session is dead and is replaced by a
+    login; any other failure propagates for the caller's retry logic.
+    """
+    with _session_lock:
+        if client.me is None or client._session is None:
+            _sign_in_locked()
+            return
+        try:
+            if client._should_refresh_session():
+                client._refresh_and_set_session()
+        except Exception as exc:
+            if not _session_is_dead(exc):
+                raise
+            log.warning("Session refresh rejected (%s); logging in again", _brief_error(exc))
+            _login_locked()
 
 
 def _xrpc_get(endpoint: str, params: dict | None = None) -> dict:
@@ -153,15 +256,18 @@ def _dm():
     Bluesky DMs live behind the central chat service, not the account's PDS, so
     requests must carry the `atproto-proxy: did:web:api.bsky.chat#bsky_chat`
     header. `with_bsky_chat_proxy()` clones the live client (sharing its
-    refreshed session) and injects that header; calling it per-tool is cheap and
-    always uses a current access token. Group chats are just convos with
-    kind="group", so the same namespace handles 1:1 and group messages.
+    session) and injects that header; the clone is handed the shared session
+    lock so its refreshes serialize with everyone else's. Group chats are just
+    convos with kind="group", so the same namespace handles 1:1 and group
+    messages.
 
     NOTE: the account's app password must have "Allow access to your direct
     messages" enabled, or every call raises InvalidToken ("Bad token method").
     """
     _ensure_session()
-    return client.with_bsky_chat_proxy().chat.bsky.convo
+    chat = client.with_bsky_chat_proxy()
+    chat._refresh_lock = _session_lock
+    return chat.chat.bsky.convo
 
 
 def _get_raw_preferences() -> list[dict]:
@@ -189,33 +295,72 @@ def _extract_saved_feed_uris(prefs: list[dict]) -> list[str]:
     return list(dict.fromkeys(generator_uris))
 
 
+# --- Caches ---
+#
+# name.lower() -> AT URI. A refresh builds a new dict and swaps it in whole, so
+# a failed refresh keeps the last good snapshot and readers never see a
+# half-built map. The generation counters let a burst of misses share one
+# refresh instead of each issuing its own.
+
+feed_cache: dict[str, str] = {}
+list_cache: dict[str, str] = {}
+_cache_gen = {"feed": 0, "list": 0}
+_cache_refresh_locks = {"feed": threading.Lock(), "list": threading.Lock()}
+_cache_write_lock = threading.Lock()
+
+
 def _unique_cache_key(cache: dict, name: str, uri: str) -> str:
-    """Return a key for the cache, appending a suffix if the name is already taken by a different URI."""
+    """A key for this URI: the bare name, or the name plus a URI-derived suffix
+    when a different URI already holds it.
+
+    The suffix starts with the rkey (readable) and falls back to the rkey plus
+    the repo DID tail (rkeys repeat across accounts), then a counter, checking
+    each candidate so two sources can never share a key.
+    """
     key = name.lower()
-    if key not in cache or cache[key] == uri:
+    if cache.get(key, uri) == uri:
         return key
-    # Disambiguate by appending the last segment of the URI
-    return f"{key} ({uri.split('/')[-1]})"
+    parts = uri.removeprefix("at://").split("/")
+    repo = parts[0] if parts else ""
+    rkey = parts[-1] if len(parts) > 1 else uri
+    candidates = [f"{key} ({rkey})", f"{key} ({rkey} {repo[-8:]})"]
+    candidates += (f"{key} ({rkey} {repo[-8:]} #{n})" for n in range(2, 1000))
+    for candidate in candidates:
+        if cache.get(candidate, uri) == uri:
+            return candidate
+    raise RuntimeError(f"could not find a unique cache key for {uri}")
 
 
-def refresh_feed_cache():
-    """Rebuild feed cache from saved preferences."""
-    feed_cache.clear()
+def _publish_cache(kind: str, new: dict[str, str]) -> None:
+    global feed_cache, list_cache
+    with _cache_write_lock:
+        if kind == "feed":
+            feed_cache = new
+        else:
+            list_cache = new
+        _cache_gen[kind] += 1
+
+
+def refresh_feed_cache() -> list[tuple[str, object]]:
+    """Rebuild the feed cache from saved preferences. Returns (cache_key, generator_view) pairs."""
     prefs = _get_raw_preferences()
     generator_uris = _extract_saved_feed_uris(prefs)
-    if generator_uris:
-        for i in range(0, len(generator_uris), 25):
-            batch = generator_uris[i : i + 25]
-            resp = client.app.bsky.feed.get_feed_generators({"feeds": batch})
-            for gen in resp.feeds:
-                name = gen.display_name or gen.uri
-                key = _unique_cache_key(feed_cache, name, gen.uri)
-                feed_cache[key] = gen.uri
+    new: dict[str, str] = {}
+    entries: list[tuple[str, object]] = []
+    for i in range(0, len(generator_uris), 25):
+        batch = generator_uris[i : i + 25]
+        resp = client.app.bsky.feed.get_feed_generators({"feeds": batch})
+        for gen in resp.feeds:
+            key = _unique_cache_key(new, gen.display_name or gen.uri, gen.uri)
+            new[key] = gen.uri
+            entries.append((key, gen))
+    _publish_cache("feed", new)
+    return entries
 
 
 def refresh_list_cache() -> list[tuple[str, object]]:
     """Rebuild list cache from account's lists. Returns (cache_key, list_view) pairs."""
-    list_cache.clear()
+    new: dict[str, str] = {}
     entries: list[tuple[str, object]] = []
     cursor = None
     while True:
@@ -224,13 +369,21 @@ def refresh_list_cache() -> list[tuple[str, object]]:
             params["cursor"] = cursor
         resp = client.app.bsky.graph.get_lists(params)
         for lst in resp.lists:
-            key = _unique_cache_key(list_cache, lst.name, lst.uri)
-            list_cache[key] = lst.uri
+            key = _unique_cache_key(new, lst.name, lst.uri)
+            new[key] = lst.uri
             entries.append((key, lst))
-        if not resp.cursor:
+        if not resp.cursor or resp.cursor == cursor:
             break
         cursor = resp.cursor
+    _publish_cache("list", new)
     return entries
+
+
+def _refresh_on_miss(kind: str, seen_gen: int) -> None:
+    """Refresh one cache unless another call already did since `seen_gen`."""
+    with _cache_refresh_locks[kind]:
+        if _cache_gen[kind] == seen_gen:
+            (refresh_feed_cache if kind == "feed" else refresh_list_cache)()
 
 
 def refresh_caches():
@@ -238,47 +391,100 @@ def refresh_caches():
     refresh_list_cache()
 
 
-refresh_caches()
-
-# --- SQLite post ID store ---
+# --- SQLite ---
+#
+# sqlite3's own context manager commits or rolls back but never closes, so
+# every use goes through _db(): closing() releases the connection, `with conn`
+# keeps the transaction semantics. Schemas are created on first use, not at
+# import.
 
 _DB_PATH = "post_ids.db"
+_MUTUALS_DB_PATH = "mutuals.db"
 
-with sqlite3.connect(_DB_PATH) as _db_init:
-    _db_init.execute("""
-        CREATE TABLE IF NOT EXISTS posts (
+_DB_SCHEMAS = {
+    _DB_PATH: (
+        """CREATE TABLE IF NOT EXISTS posts (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
             at_uri     TEXT NOT NULL,
             fetched_at REAL NOT NULL
-        )
-    """)
-    _db_init.execute("CREATE INDEX IF NOT EXISTS idx_fetched_at ON posts(fetched_at)")
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_fetched_at ON posts(fetched_at)",
+        "CREATE INDEX IF NOT EXISTS idx_at_uri ON posts(at_uri)",
+        # Posts published by create_post/create_thread, so a call retried after
+        # a client timeout resumes instead of publishing a duplicate.
+        """CREATE TABLE IF NOT EXISTS publish_journal (
+            op_key     TEXT NOT NULL,
+            idx        INTEGER NOT NULL,
+            uri        TEXT NOT NULL,
+            cid        TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            PRIMARY KEY (op_key, idx)
+        )""",
+    ),
+    # A hand-curated set of accounts that matter to the user (see the mutuals
+    # section). Its own database, not a table in post_ids.db: that one is
+    # scratch that is safe to delete at any time, and this is durable state.
+    _MUTUALS_DB_PATH: (
+        """CREATE TABLE IF NOT EXISTS mutuals (
+            did      TEXT PRIMARY KEY,
+            handle   TEXT NOT NULL,
+            note     TEXT,
+            added_at REAL NOT NULL
+        )""",
+    ),
+}
+_db_ready: set[str] = set()
+_db_ready_lock = threading.Lock()
+
+
+@contextmanager
+def _db(path: str):
+    with closing(sqlite3.connect(path, timeout=10)) as conn:
+        if path not in _db_ready:
+            with _db_ready_lock:
+                if path not in _db_ready:
+                    with conn:
+                        for stmt in _DB_SCHEMAS.get(path, ()):
+                            conn.execute(stmt)
+                    _db_ready.add(path)
+        with conn:
+            yield conn
 
 
 def _db_store_posts(at_uris: list[str]) -> list[int]:
-    """Return short IDs, refreshing repeats and recycling IDs after their TTL."""
+    """Return short IDs, refreshing repeats and recycling IDs after the reuse delay.
+
+    An ID resolves for _POST_ID_TTL after it was last issued; its number stays
+    reserved until _POST_ID_REUSE_AFTER, and a post seen again inside that span
+    gets its old number back.
+    """
     now = time.time()
-    with sqlite3.connect(_DB_PATH) as conn:
+    with _db(_DB_PATH) as conn:
         # Serialize allocation so two concurrent renders cannot choose the same
         # newly freed ID.  AUTOINCREMENT remains in the schema for compatibility
         # with existing databases, but IDs are assigned explicitly from the pool.
         conn.execute("BEGIN IMMEDIATE")
-        conn.execute("DELETE FROM posts WHERE fetched_at < ?", (now - _POST_ID_TTL,))
+        conn.execute("DELETE FROM posts WHERE fetched_at < ?", (now - _POST_ID_REUSE_AFTER,))
 
-        rows = conn.execute(
-            "SELECT id, at_uri FROM posts ORDER BY id"
-        ).fetchall()
-        used_ids = {row[0] for row in rows}
-        # If a URI has several still-live IDs from the old allocator, retain the
-        # newest one for future renders; all older IDs remain valid until expiry.
-        uri_to_id = {uri: post_id for post_id, uri in rows}
+        used_ids = {row[0] for row in conn.execute("SELECT id FROM posts")}
+        wanted = list(dict.fromkeys(at_uris))
+        uri_to_id: dict[str, int] = {}
+        for start in range(0, len(wanted), 500):
+            chunk = wanted[start : start + 500]
+            marks = ",".join("?" * len(chunk))
+            # ORDER BY id: if a URI has several rows from the old allocator, the
+            # newest one wins for future renders; the others age out.
+            for post_id, uri in conn.execute(
+                f"SELECT id, at_uri FROM posts WHERE at_uri IN ({marks}) ORDER BY id", chunk
+            ):
+                uri_to_id[uri] = post_id
 
         next_id = 1
         ids: list[int] = []
         for uri in at_uris:
             post_id = uri_to_id.get(uri)
             if post_id is not None:
-                # Seeing the post again renews this ID's full one-hour lease.
+                # Seeing the post again renews this ID's lease.
                 conn.execute(
                     "UPDATE posts SET fetched_at = ? WHERE id = ?", (now, post_id)
                 )
@@ -294,19 +500,51 @@ def _db_store_posts(at_uris: list[str]) -> list[int]:
                 uri_to_id[uri] = post_id
                 next_id += 1
             ids.append(post_id)
-        conn.commit()
     return ids
 
 
 def _db_lookup_post(post_id: int) -> str | None:
     """Return the AT URI for a post ID if it is still within the TTL window."""
     cutoff = time.time() - _POST_ID_TTL
-    with sqlite3.connect(_DB_PATH) as conn:
+    with _db(_DB_PATH) as conn:
         row = conn.execute(
             "SELECT at_uri FROM posts WHERE id = ? AND fetched_at >= ?",
             (post_id, cutoff),
         ).fetchone()
     return row[0] if row else None
+
+
+_PUBLISH_JOURNAL_TTL = 3600
+
+
+def _journal_lookup(op_key: str) -> dict[int, tuple[str, str]]:
+    """Posts already published under this operation key: idx -> (uri, cid)."""
+    cutoff = time.time() - _PUBLISH_JOURNAL_TTL
+    with _db(_DB_PATH) as conn:
+        conn.execute("DELETE FROM publish_journal WHERE created_at < ?", (cutoff,))
+        rows = conn.execute(
+            "SELECT idx, uri, cid FROM publish_journal WHERE op_key = ?", (op_key,)
+        ).fetchall()
+    return {idx: (uri, cid) for idx, uri, cid in rows}
+
+
+def _journal_record(op_key: str, idx: int, uri: str, cid: str) -> None:
+    try:
+        with _db(_DB_PATH) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO publish_journal (op_key, idx, uri, cid, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (op_key, idx, uri, cid, time.time()),
+            )
+    except Exception as exc:  # the post exists either way; only resume suffers
+        log.warning("Could not journal published post %s: %s", uri, exc)
+
+
+def _journal_forget(op_key: str, from_idx: int = 0) -> None:
+    with _db(_DB_PATH) as conn:
+        conn.execute(
+            "DELETE FROM publish_journal WHERE op_key = ? AND idx >= ?", (op_key, from_idx)
+        )
 
 
 # --- Mutuals roster ---
@@ -316,20 +554,7 @@ def _db_lookup_post(post_id: int) -> str | None:
 # from the crowd — and the only way to find them at all in mode="index", whose
 # entries are topics, not authors.
 #
-# Its own database, not a table in post_ids.db: that one is a 1 h TTL scratch
-# store that is safe to delete at any time, and this is durable state.
-
-_MUTUALS_DB_PATH = "mutuals.db"
-
-with sqlite3.connect(_MUTUALS_DB_PATH) as _mutuals_init:
-    _mutuals_init.execute("""
-        CREATE TABLE IF NOT EXISTS mutuals (
-            did      TEXT PRIMARY KEY,
-            handle   TEXT NOT NULL,
-            note     TEXT,
-            added_at REAL NOT NULL
-        )
-    """)
+# Stored in mutuals.db (schema in _DB_SCHEMAS), durable unlike post_ids.db.
 
 
 def _db_add_mutual(did: str, handle: str, note: str | None) -> bool:
@@ -338,7 +563,7 @@ def _db_add_mutual(did: str, handle: str, note: str | None) -> bool:
     Keyed on DID so a handle change updates in place instead of orphaning the
     entry; an existing note survives an add that doesn't supply one.
     """
-    with sqlite3.connect(_MUTUALS_DB_PATH) as conn:
+    with _db(_MUTUALS_DB_PATH) as conn:
         existing = conn.execute(
             "SELECT note FROM mutuals WHERE did = ?", (did,)
         ).fetchone()
@@ -352,13 +577,12 @@ def _db_add_mutual(did: str, handle: str, note: str | None) -> bool:
                 "INSERT INTO mutuals (did, handle, note, added_at) VALUES (?, ?, ?, ?)",
                 (did, handle, note, time.time()),
             )
-        conn.commit()
     return existing is None
 
 
 def _db_list_mutuals() -> list[tuple[str, str, str | None, float]]:
     """All mutuals as (did, handle, note, added_at), oldest first."""
-    with sqlite3.connect(_MUTUALS_DB_PATH) as conn:
+    with _db(_MUTUALS_DB_PATH) as conn:
         return conn.execute(
             "SELECT did, handle, note, added_at FROM mutuals ORDER BY added_at"
         ).fetchall()
@@ -367,7 +591,7 @@ def _db_list_mutuals() -> list[tuple[str, str, str | None, float]]:
 def _db_remove_mutual(handle_or_did: str) -> str | None:
     """Delete by DID or handle. Returns the removed handle, or None if absent."""
     key = handle_or_did.strip().lstrip("@").lower()
-    with sqlite3.connect(_MUTUALS_DB_PATH) as conn:
+    with _db(_MUTUALS_DB_PATH) as conn:
         row = conn.execute(
             "SELECT did, handle FROM mutuals WHERE did = ? OR lower(handle) = ?",
             (handle_or_did.strip(), key),
@@ -375,7 +599,6 @@ def _db_remove_mutual(handle_or_did: str) -> str | None:
         if not row:
             return None
         conn.execute("DELETE FROM mutuals WHERE did = ?", (row[0],))
-        conn.commit()
     return row[1]
 
 
@@ -451,17 +674,33 @@ _NOTIFICATION_REASONS = {
 # --- Helpers ---
 
 
+_BSKY_WEB_HOSTS = {"bsky.app", "www.bsky.app"}
+_RKEY_RE = re.compile(r"^[A-Za-z0-9._:~-]{1,512}$")
+
+
+def _parse_bsky_post_url(url: str) -> tuple[str, str]:
+    """(handle-or-DID, rkey) from a bsky.app post URL.
+
+    Parsed structurally: share links carry ?ref_src=… or #fragments, which a
+    path regex would swallow into the rkey and turn into an invalid AT URI.
+    """
+    parsed = urlparse(url.strip())
+    if parsed.scheme not in ("http", "https") or (parsed.hostname or "").lower() not in _BSKY_WEB_HOSTS:
+        raise ValueError(f"Invalid bsky.app URL: {url}")
+    segments = [s for s in parsed.path.split("/") if s]
+    # Trailing segments (/liked-by, /reposted-by, /quotes) still name the post.
+    if len(segments) < 4 or segments[0] != "profile" or segments[2] != "post":
+        raise ValueError(f"Invalid bsky.app post URL (expected /profile/<handle>/post/<rkey>): {url}")
+    actor, rkey = segments[1], segments[3]
+    if not _RKEY_RE.match(rkey):
+        raise ValueError(f"Invalid post key in URL: {url}")
+    return actor, rkey
+
+
 def resolve_bsky_url(url: str) -> str:
     """Convert a https://bsky.app/profile/handle/post/rkey URL to an AT URI."""
-    match = re.match(r"https?://bsky\.app/profile/([^/]+)/post/([^/]+)", url)
-    if not match:
-        raise ValueError(f"Invalid bsky.app URL: {url}")
-    handle, rkey = match.group(1), match.group(2)
-    if handle.startswith("did:"):
-        did = handle
-    else:
-        profile = client.app.bsky.actor.get_profile({"actor": handle})
-        did = profile.did
+    actor, rkey = _parse_bsky_post_url(url)
+    did = actor if actor.startswith("did:") else _resolve_did(actor)
     return f"at://{did}/app.bsky.feed.post/{rkey}"
 
 
@@ -510,28 +749,36 @@ def _root_uri_from_thread_node(node) -> str:
     return root.post.uri
 
 
+def _cache_lookup(kind: str, key: str) -> str | None:
+    """Look a name up in one cache, refreshing it once on a miss."""
+    def current():
+        return feed_cache if kind == "feed" else list_cache
+    seen_gen = _cache_gen[kind]
+    uri = current().get(key)
+    if uri is None:
+        _refresh_on_miss(kind, seen_gen)
+        uri = current().get(key)
+    return uri
+
+
 def resolve_feed_uri(name_or_uri: str) -> str:
     if name_or_uri.startswith("at://"):
         return name_or_uri
-    key = name_or_uri.lower()
-    if key not in feed_cache:
-        refresh_feed_cache()
-    if key not in feed_cache:
-        available = ", ".join(sorted(feed_cache.keys())) or "(none)"
+    uri = _cache_lookup("feed", name_or_uri.lower())
+    if uri is None:
+        available = ", ".join(sorted(feed_cache)) or "(none)"
         raise ValueError(f"Feed '{name_or_uri}' not found. Available feeds: {available}")
-    return feed_cache[key]
+    return uri
 
 
 def resolve_list_uri(name_or_uri: str) -> str:
     if name_or_uri.startswith("at://"):
         return name_or_uri
-    key = name_or_uri.lower()
-    if key not in list_cache:
-        refresh_list_cache()
-    if key not in list_cache:
-        available = ", ".join(sorted(list_cache.keys())) or "(none)"
+    uri = _cache_lookup("list", name_or_uri.lower())
+    if uri is None:
+        available = ", ".join(sorted(list_cache)) or "(none)"
         raise ValueError(f"List '{name_or_uri}' not found. Available lists: {available}")
-    return list_cache[key]
+    return uri
 
 
 _LIST_COLLECTION = "app.bsky.graph.list"
@@ -579,49 +826,75 @@ def _owned_list_record(name_or_uri: str) -> tuple[str, str, dict]:
 
 def _cache_owned_list(name: str, uri: str) -> str:
     """Replace this URI's old cache key and return its current disambiguated key."""
-    for key, cached_uri in list(list_cache.items()):
-        if cached_uri == uri:
-            del list_cache[key]
-    key = _unique_cache_key(list_cache, name, uri)
-    list_cache[key] = uri
+    global list_cache
+    with _cache_write_lock:
+        new = {k: v for k, v in list_cache.items() if v != uri}
+        key = _unique_cache_key(new, name, uri)
+        new[key] = uri
+        list_cache = new
     return key
 
 
 def _remove_cached_list(uri: str) -> None:
-    for key, cached_uri in list(list_cache.items()):
-        if cached_uri == uri:
-            del list_cache[key]
+    global list_cache
+    with _cache_write_lock:
+        list_cache = {k: v for k, v in list_cache.items() if v != uri}
 
 
-def _raw_repo_records(collection: str, cap: int = 50000) -> list[dict]:
-    """Enumerate records in the authenticated repo, newest first, up to cap."""
+# Mutations need the whole membership set; this only guards against a server
+# that never stops paginating.
+_REPO_SCAN_HARD_CAP = 1_000_000
+
+
+def _raw_repo_records(collection: str, cap: int | None = None) -> tuple[list[dict], bool]:
+    """Enumerate records in the authenticated repo, newest first.
+
+    Returns (records, complete). complete is False when `cap` (or the hard cap)
+    stopped the scan before the collection ended — callers that act on the
+    absence of a record must treat that as unknown, not as absent.
+    """
+    limit = min(cap, _REPO_SCAN_HARD_CAP) if cap is not None else _REPO_SCAN_HARD_CAP
     records: list[dict] = []
     cursor = None
     previous = None
-    while len(records) < cap:
+    while len(records) < limit:
+        _raise_if_cancelled()
         params: dict = {
             "repo": client.me.did,
             "collection": collection,
-            "limit": min(100, cap - len(records)),
+            "limit": min(100, limit - len(records)),
         }
         if cursor:
             params["cursor"] = cursor
         data = _xrpc_get("com.atproto.repo.listRecords", params)
         page = data.get("records") or []
         if not page:
-            break
+            return records, True
         records.extend(page)
         cursor = data.get("cursor")
-        if not cursor or cursor == previous:
-            break
+        if not cursor:
+            return records, True
+        if cursor == previous:
+            return records, False  # a repeating cursor proves nothing about the rest
         previous = cursor
-    return records
+    return records, False
 
 
 def _listitem_index() -> dict[tuple[str, str], list[str]]:
-    """Map (list URI, subject DID) to every underlying membership record URI."""
+    """Map (list URI, subject DID) to every underlying membership record URI.
+
+    Covers every list in the account, so it must be complete: list writes act
+    on what it does not contain (add skips existing members, delete removes
+    exactly what it found).
+    """
+    items, complete = _raw_repo_records(_LISTITEM_COLLECTION)
+    if not complete:
+        raise ToolError(
+            f"Could not enumerate every list membership record (stopped after {len(items)}); "
+            "nothing was changed."
+        )
     index: dict[tuple[str, str], list[str]] = {}
-    for item in _raw_repo_records(_LISTITEM_COLLECTION):
+    for item in items:
         value = item.get("value") or {}
         list_uri = value.get("list")
         subject = value.get("subject")
@@ -635,6 +908,9 @@ def _apply_writes_in_chunks(writes: list[dict], chunk_size: int = 100) -> tuple[
     """Apply atomic chunks and report the committed prefix if a later chunk fails."""
     applied = 0
     for start in range(0, len(writes), chunk_size):
+        if _cancelled():
+            log.warning("applyWrites cancelled by the client after %d/%d writes", applied, len(writes))
+            return applied, "cancelled by the client"
         chunk = writes[start : start + chunk_size]
         try:
             _xrpc_post(
@@ -712,6 +988,32 @@ def _resolve_actor_inputs(actors: list[str] | str) -> tuple[list[dict], list[str
                 "display_name": profile.get("displayName") or "",
             }
         )
+    return resolved, failed, duplicates
+
+
+def _resolve_removal_inputs(actors: list[str] | str) -> tuple[list[dict], list[str], list[str]]:
+    """Like _resolve_actor_inputs, but without requiring a live profile.
+
+    Removal is exactly when an account may be deactivated, suspended or
+    deleted, so a DID is used as given and a handle only needs to resolve to a
+    DID; the stored membership index decides what exists.
+    """
+    wanted = _v2_list(actors, strip_prefix="@") or []
+    resolved: list[dict] = []
+    failed: list[str] = []
+    duplicates: list[str] = []
+    seen_dids: set[str] = set()
+    for original in wanted:
+        try:
+            did = _resolve_did(original)
+        except Exception as exc:
+            failed.append(f"{original} ({_brief_error(exc)})")
+            continue
+        if did in seen_dids:
+            duplicates.append(original)
+            continue
+        seen_dids.add(did)
+        resolved.append({"input": original, "did": did, "handle": original, "display_name": ""})
     return resolved, failed, duplicates
 
 
@@ -832,6 +1134,25 @@ def _get_gallery_items(embed_or_media) -> list:
     return list(items) if isinstance(items, (list, tuple)) else []
 
 
+def _video_alt(container) -> str | None:
+    """Alt text ("" if none) when `container` is a video embed, else None.
+
+    The AppView returns app.bsky.embed.video#view, which exposes playlist,
+    thumbnail and alt directly; only the authoring record nests a blob under
+    .video (with alt beside it). Both shapes reach the renderers — views in
+    feeds, records inside quoted-post values — so both are recognised.
+    """
+    if container is None:
+        return None
+    pt = (getattr(container, "py_type", "") or "").lower()
+    if getattr(container, "playlist", None) or pt.startswith("app.bsky.embed.video"):
+        return (getattr(container, "alt", "") or "").strip()
+    video = getattr(container, "video", None)
+    if video:
+        return (getattr(container, "alt", None) or getattr(video, "alt", "") or "").strip()
+    return None
+
+
 def _get_embed_info(post, include_image_urls: bool = False) -> str | None:
     """Format embed info as a text line.
 
@@ -881,9 +1202,8 @@ def _get_embed_info(post, include_image_urls: bool = False) -> str | None:
             return base + _img_urls(imgs)
 
     # Video
-    if hasattr(embed, "video") and embed.video:
-        video = embed.video
-        alt = getattr(video, "alt", "") or ""
+    alt = _video_alt(embed)
+    if alt is not None:
         return "[Video]" + (f" Alt: {alt}" if alt else "")
 
     # Record with media
@@ -911,8 +1231,8 @@ def _get_embed_info(post, include_image_urls: bool = False) -> str | None:
             if alts:
                 base += " Alt: " + "; ".join(alts)
             return base + _img_urls(imgs)
-        if hasattr(media, "video") and media.video:
-            alt = getattr(media.video, "alt", "") or ""
+        alt = _video_alt(media)
+        if alt is not None:
             return "[Quote+video]" + (f" Alt: {alt}" if alt else "")
         return "[Quote+media]"
 
@@ -922,8 +1242,9 @@ def _get_embed_info(post, include_image_urls: bool = False) -> str | None:
 def _extract_quoted_post(post):
     """Extract quoted post info. Returns (handle, display, ts_datetime, text) or None.
 
-    For notFound / blocked quotes, returns ("?", "?", None, "[Quoted post not available]")
-    so the unavailable marker surfaces in callers' text field.
+    For viewNotFound / viewBlocked / viewDetached quotes, returns
+    ("?", "?", None, "[Quoted post not available: <reason>]") so the marker
+    surfaces in callers' text field.
     """
     embed = getattr(post, "embed", None)
     if not embed:
@@ -942,10 +1263,14 @@ def _extract_quoted_post(post):
     if hasattr(record_embed, "record"):
         inner = record_embed.record
 
-    # Check for not found / blocked
-    inner_type = getattr(inner, "py_type", "") or ""
-    if "notFound" in inner_type or "blocked" in inner_type:
-        return ("?", "?", None, "[Quoted post not available]")
+    # Unavailable quotes: the discriminators are #viewNotFound, #viewBlocked
+    # and #viewDetached, and the models also carry a matching boolean flag.
+    inner_type = (getattr(inner, "py_type", "") or "").lower()
+    for marker, flag, reason in (("notfound", "not_found", "deleted"),
+                                 ("blocked", "blocked", "blocked"),
+                                 ("detached", "detached", "detached by its author")):
+        if marker in inner_type or getattr(inner, flag, False) is True:
+            return ("?", "?", None, f"[Quoted post not available: {reason}]")
 
     if not hasattr(inner, "author"):
         return None
@@ -1015,7 +1340,7 @@ def _get_embed_type(post) -> tuple[str, int]:
         return "none", 0
     if hasattr(embed, "external") and embed.external:
         return "url", 0
-    if hasattr(embed, "video") and embed.video:
+    if _video_alt(embed) is not None:
         return "video", 0
     if hasattr(embed, "images") and embed.images and not hasattr(embed, "media"):
         return "images", len(embed.images)
@@ -1028,7 +1353,7 @@ def _get_embed_type(post) -> tuple[str, int]:
             return "url", 0
         if hasattr(media, "images") and media.images:
             return "images", len(media.images)
-        if hasattr(media, "video") and media.video:
+        if _video_alt(media) is not None:
             return "video", 0
         media_gallery = _get_gallery_items(media)
         if media_gallery:
@@ -1226,73 +1551,155 @@ def format_post_text(feed_view, reposters=None, reply_parent=None, image_urls: b
     return "\n".join(lines)
 
 
+# --- Cancellation ---
+# asyncio.to_thread cannot stop a running worker: cancelling the awaiting task
+# only abandons it, and a synchronous publisher would carry on through every
+# remaining write. _run_tool hands the worker an Event through a ContextVar
+# (to_thread copies the context into the thread) and sets it when the call is
+# cancelled; workers check it between side effects and between pages.
+
+_cancel_event: contextvars.ContextVar[threading.Event | None] = contextvars.ContextVar(
+    "_cancel_event", default=None
+)
+
+
+class _Cancelled(Exception):
+    """The client cancelled the tool call; nobody will read the result."""
+
+
+def _cancelled() -> bool:
+    event = _cancel_event.get()
+    return event is not None and event.is_set()
+
+
+def _raise_if_cancelled(progress: str = "") -> None:
+    if _cancelled():
+        if progress:
+            log.warning("Tool call cancelled by the client; %s", progress)
+        raise _Cancelled(progress or "cancelled by the client")
+
+
+async def _run_tool(fn, *args):
+    """asyncio.to_thread with cooperative cancellation (see above)."""
+    event = threading.Event()
+    token = _cancel_event.set(event)
+    try:
+        return await asyncio.to_thread(fn, *args)
+    except asyncio.CancelledError:
+        event.set()
+        raise
+    finally:
+        _cancel_event.reset(token)
+
+
 # --- Pagination ---
 
-_TIME_FETCH_CAP = 20000  # hard cap for unbounded time-window fetches
+_TIME_FETCH_CAP = 20000  # hard cap on raw items held by one time-window fetch
+_MAX_FEED_PAGES = 500
+# How many consecutive pages entirely older than the window an unordered
+# (ranked) source may return before the walk gives up — see fetch_by_time.
+_RANKED_OLD_PAGES = 3
+# Statuses worth retrying for a read. 409/413 come back from the SDK as
+# NetworkError too, but replaying them changes nothing.
+_TRANSIENT_STATUS = {408, 425, 429, 500, 502, 503, 504}
+
+
+class _UpstreamError(Exception):
+    """A read still failed after its retries; the message is a one-line reason."""
+
+
+class _Fetched(list):
+    """Feed items plus notes on how the walk ended, shown in the output header.
+
+    A walk that stops on an upstream error, a page cap or a ranked-feed budget
+    must say so — otherwise a partial window reads as the whole window.
+    """
+
+    def __init__(self, items=(), notes=None):
+        super().__init__(items)
+        self.notes: list[str] = list(notes or [])
+
+
+def _error_status(exc) -> int | None:
+    return getattr(getattr(exc, "response", None), "status_code", None)
+
+
+def _is_transient(exc: Exception) -> bool:
+    """Timeouts, transport failures, 429 and gateway/service 5xx.
+
+    Decided on exception type and status code, never on the message: an SDK
+    InvokeTimeoutError raised without a response stringifies to "".
+    """
+    status = _error_status(exc)
+    if status is not None:
+        return status in _TRANSIENT_STATUS
+    return isinstance(exc, (atproto_exc.NetworkError, httpx.TransportError))
+
+
+def _retry_delay(exc, fallback: float) -> float:
+    """Server-requested wait for a 429 (capped at 60 s), else `fallback`."""
+    wait = getattr(exc, "retry_after", None)  # RateLimitExceededError parses both forms
+    if wait is None:
+        raw = (getattr(getattr(exc, "response", None), "headers", None) or {}).get("retry-after")
+        try:
+            wait = float(raw) if raw else None
+        except (TypeError, ValueError):
+            wait = None  # an HTTP-date; use our own backoff
+    return min(wait, 60.0) if wait is not None else fallback
 
 
 def _retry_fetch(fetch_fn, cursor, limit: int = 100, max_attempts: int = 3):
-    """Call fetch_fn(cursor, limit) with retry on transient errors.
+    """Call fetch_fn(cursor=..., limit=...), retrying transient failures.
 
-    Returns (response, should_break). should_break=True means stop pagination gracefully.
+    Raises _UpstreamError once the retries are spent, so pagination can tell
+    "the source ended" from "the source failed"; any other error propagates
+    unchanged. Only page reads go through here, and those are safe to replay.
     """
     delay = 1.0
-    for attempt in range(max_attempts):
+    for attempt in range(1, max_attempts + 1):
+        _raise_if_cancelled()
         try:
-            return fetch_fn(cursor=cursor, limit=limit), False
+            return fetch_fn(cursor=cursor, limit=limit)
         except Exception as e:
-            msg = str(e).lower()
-            status = getattr(getattr(e, "response", None), "status_code", None)
-
-            if status == 429:
-                ra_raw = getattr(getattr(e, "response", None), "headers", {}).get("retry-after")
-                try:
-                    # Retry-After may also be an HTTP date — fall back to our own delay.
-                    retry_after = min(float(ra_raw), 60.0) if ra_raw else delay
-                except (TypeError, ValueError):
-                    retry_after = delay
-                log.warning("Rate limited (429), sleeping %.1fs", retry_after)
-                time.sleep(retry_after)
-                delay *= 2
-                continue
-
-            if status == 500:
-                log.warning("HTTP 500 on cursor %s (attempt %d), %s",
-                            cursor, attempt + 1, "retrying" if attempt < max_attempts - 1 else "stopping")
-                if attempt == max_attempts - 1:
-                    return None, True
-                time.sleep(delay)
-                delay *= 2
-                continue
-
-            if any(x in msg for x in ("timeout", "connect", "network", "connection")):
-                log.warning("Transient error on cursor %s (attempt %d): %s",
-                            cursor, attempt + 1, type(e).__name__)
-                if attempt == max_attempts - 1:
-                    return None, True
-                time.sleep(delay)
-                delay *= 2
-                continue
-
-            raise
-
-    return None, True
+            if not _is_transient(e):
+                raise
+            status = _error_status(e)
+            reason = f"HTTP {status}" if status else type(e).__name__
+            if attempt == max_attempts:
+                raise _UpstreamError(f"{reason} after {max_attempts} attempts") from e
+            wait = _retry_delay(e, delay) if status == 429 else delay
+            log.warning("Transient %s on cursor %s (attempt %d/%d), retrying in %.1fs",
+                        reason, cursor, attempt, max_attempts, wait)
+            time.sleep(wait)
+            delay *= 2
+    raise AssertionError("unreachable")
 
 
-def fetch_by_count(fetch_fn, target_count: int, min_chars: int = 0) -> list:
+def _walk_failed(exc: _UpstreamError, usable: int, pages: int) -> str:
+    """Note for a walk cut short by an upstream failure — or a ToolError if it got nothing."""
+    if not usable:
+        raise ToolError(f"Bluesky did not answer: {exc}. Nothing was fetched; try again shortly.") from exc
+    return f"PARTIAL — upstream error on page {pages + 1} ({exc}); older posts are missing"
+
+
+def fetch_by_count(fetch_fn, target_count: int, min_chars: int = 0) -> _Fetched:
     """Fetch raw feed items, paginating until we have target_count posts after dedup and filtering."""
     _t0 = time.monotonic()
-    results = []
+    results = _Fetched()
     cursor = None
     seen_uris: set[str] = set()
     good_count = 0
     prev_cursor = None
     empty_pages = 0
-    max_pages = 500
     pages = 0
-    while good_count < target_count and pages < max_pages:
-        resp, should_break = _retry_fetch(fetch_fn, cursor)
-        if should_break or resp is None:
+    while good_count < target_count:
+        if pages >= _MAX_FEED_PAGES:
+            results.notes.append(f"stopped after {_MAX_FEED_PAGES} pages")
+            break
+        try:
+            resp = _retry_fetch(fetch_fn, cursor)
+        except _UpstreamError as exc:
+            results.notes.append(_walk_failed(exc, good_count, pages))
             break
         pages += 1
         feed = resp.feed if hasattr(resp, "feed") else []
@@ -1328,30 +1735,42 @@ def fetch_by_count(fetch_fn, target_count: int, min_chars: int = 0) -> list:
     return results
 
 
-def fetch_by_time(fetch_fn, since_minutes: int, max_items: int | None = None) -> list:
-    """Fetch ALL raw feed items within a time window, paginating until we pass the cutoff.
+def fetch_by_time(fetch_fn, since_minutes: int, max_items: int | None = None,
+                  min_chars: int = 0, ordered: bool = False) -> _Fetched:
+    """Fetch every feed item inside a time window.
 
-    Ranked feeds (Catsup, For You, ...) interleave old posts among new ones,
-    so an item older than the cutoff is skipped rather than treated as the end
-    of the window; pagination stops only when an entire page is older than the
-    cutoff. Chronological feeds pay at most one extra page for this.
+    `max_items` caps the result at the newest N *eligible* posts — unique and
+    passing min_chars, counted exactly as fetch_by_count counts — so duplicate
+    reposts and too-short posts never use up the caller's limit.
+    _TIME_FETCH_CAP separately bounds the raw items held.
 
-    `max_items` is an optional soft cap (newest items kept). Useful when the
-    caller is going to budget-trim downstream — capping avoids paying for
-    hundreds of pages on a high-activity feed only to discard most of them.
+    An item older than the cutoff is skipped, not taken as the end of the
+    window: ranked feeds interleave old posts among new ones. Only an `ordered`
+    source — reverse-chronological in the very timestamp being filtered (the
+    home timeline, list feeds) — ends at its first page that is entirely older
+    than the cutoff. Anything else (feed generators, likes, which are ordered by
+    like time but filtered by post time) may still hold newer posts further
+    down, so its walk ends after _RANKED_OLD_PAGES consecutive all-old pages
+    and the result says so.
     """
     _t0 = time.monotonic()
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=since_minutes)
-    item_cap = min(max_items, _TIME_FETCH_CAP) if max_items is not None else _TIME_FETCH_CAP
-    results = []
+    results = _Fetched()
+    seen_uris: set[str] = set()
+    good_count = 0
     cursor = None
     prev_cursor = None
     empty_pages = 0
-    max_pages = 500
+    old_streak = 0
     pages = 0
-    while pages < max_pages and len(results) < item_cap:
-        resp, should_break = _retry_fetch(fetch_fn, cursor)
-        if should_break or resp is None:
+    while True:
+        if pages >= _MAX_FEED_PAGES:
+            results.notes.append(f"stopped after {_MAX_FEED_PAGES} pages; older posts in the window are missing")
+            break
+        try:
+            resp = _retry_fetch(fetch_fn, cursor)
+        except _UpstreamError as exc:
+            results.notes.append(_walk_failed(exc, good_count, pages))
             break
         pages += 1
         feed = resp.feed if hasattr(resp, "feed") else []
@@ -1369,19 +1788,39 @@ def fetch_by_time(fetch_fn, since_minutes: int, max_items: int | None = None) ->
         page_has_recent = False
         for item in feed:
             ts = _get_feed_item_timestamp(item)
-            if ts is None:
-                continue  # skip items with unparseable timestamps
-            if ts < cutoff:
-                continue  # ranked feeds interleave old posts; skip, don't stop
+            if ts is None or ts < cutoff:
+                continue  # unparseable, or interleaved old post: skip, don't stop
             page_has_recent = True
             results.append(item)
-            if len(results) >= item_cap:
+            post = item.post if hasattr(item, "post") else item
+            uri = getattr(post, "uri", "") or ""
+            if uri and uri not in seen_uris:
+                seen_uris.add(uri)
+                if _passes_min_chars(item, min_chars):
+                    good_count += 1
+            if max_items is not None and good_count >= max_items:
                 done = True
                 break
-        if not page_has_recent:
-            done = True  # entire page predates the cutoff — end of the window
+            if len(results) >= _TIME_FETCH_CAP:
+                results.notes.append(f"fetch capped at {_TIME_FETCH_CAP} items; older posts in the window are missing")
+                done = True
+                break
+        if done:
+            break
+        if page_has_recent:
+            old_streak = 0
+        else:
+            old_streak += 1
+            if ordered:
+                break  # chronological source: everything further down is older
+            if old_streak >= _RANKED_OLD_PAGES:
+                results.notes.append(
+                    f"source is not in time order: stopped after {_RANKED_OLD_PAGES} pages "
+                    "older than the window; recent posts further down may be missing"
+                )
+                break
         cursor = resp.cursor if hasattr(resp, "cursor") else None
-        if done or not cursor or cursor == prev_cursor:
+        if not cursor or cursor == prev_cursor:
             break
         prev_cursor = cursor
     log.info("fetch_by_time: %d items in %.1fs (%d pages)", len(results), time.monotonic() - _t0, pages)
@@ -1442,9 +1881,21 @@ def _deduplicate_posts(items: list) -> list[tuple]:
 # --- Compact feed renderer (used by feed tools, search, likes, bookmarks) ---
 
 _VIRAL_DROP_THRESHOLD = 10  # drop metrics field if total engagement < this
-# Character budget for compact-row output (~18-20k tokens), under Claude Code's
-# default 25k-token tool-result cap with room for the header and quote table.
+# Output budget for compact rows (~18-20k tokens of English), under Claude
+# Code's default 25k-token tool-result cap with room for the header and quote
+# table. Measured in UTF-8 bytes rather than characters: CJK text and emoji
+# cost about a token per character, and bytes track that far better.
 _RAW_OUTPUT_CHAR_BUDGET = int(os.getenv("MCP_RAW_OUTPUT_CHARS", "72000"))
+# Digits charged per post ID while sizing rows, before IDs are allocated.
+_ID_WIDTH_ESTIMATE = 6
+
+
+def _out_size(text: str) -> int:
+    return len(text.encode("utf-8"))
+
+
+def _notes_line(notes) -> str:
+    return ("⚠ " + "; ".join(notes) + "\n") if notes else ""
 
 
 def _render_quote_entry(q_handle: str, q_time: str, q_text: str, strategy: str, parent_text: str) -> str:
@@ -1481,12 +1932,16 @@ def _render_compact_feed(
     truncate or reject oversized tool results (Claude Code at 25k tokens by
     default), so rows past the cap are cut — newest kept, in feed order — and a
     footer says how many and how to narrow (overflow_hint). A visible cut, not a
-    silent one and not a sample.
+    silent one and not a sample. Rows are sized before IDs are allocated, so
+    only kept rows (and the in-batch parents they reply to) take an ID.
+
+    Notes attached to `items` by the fetch (_Fetched.notes: partial walks,
+    caps) are shown at the top so an incomplete window never reads as whole.
 
     extra_cols maps post AT URI -> a short string inserted as an extra column
     right after the time column (bookmarks use it for the bookmark date).
     """
-    cap_note = f" [fetch capped at {_TIME_FETCH_CAP}]" if len(items) >= _TIME_FETCH_CAP else ""
+    notes = list(getattr(items, "notes", None) or [])
     raw_count = len(items)
 
     deduped = _deduplicate_posts(items)
@@ -1502,7 +1957,7 @@ def _render_compact_feed(
     eligible_count = len(deduped)
 
     if not deduped:
-        return "No posts found."
+        return _notes_line(notes) + "No posts found."
 
     # Scope cap: newest max_posts (items arrive newest-first in feed order)
     if max_posts is not None and len(deduped) > max_posts:
@@ -1561,7 +2016,7 @@ def _render_compact_feed(
     selected = candidates  # already in feed order
 
     if not selected:
-        return "No posts found."
+        return _notes_line(notes) + "No posts found."
 
     # --- Notable author threshold (top 10% by like_count) ---
 
@@ -1573,105 +2028,18 @@ def _render_compact_feed(
     p90_likes = like_counts[p90_idx] if like_counts else 0
     notable_threshold = max(p90_likes, 1)  # avoid flagging everything when all have 0 likes
 
-    # --- Build quote table + reverse map (single pass) ---
-
-    quote_table: dict[str, tuple] = {}  # quoted_uri -> (QN_label, handle, ts_dt, text)
-    quote_uri_to_label: dict[str, str] = {}
-    post_to_quoted_uri: dict[str, str] = {}
-    q_counter = 0
-    for c in selected:
-        if not c.quoted or not c.quoted_uri:
-            continue
-        quoted_uri = c.quoted_uri
-        if quoted_uri not in quote_uri_to_label:
-            q_counter += 1
-            label = f"Q{q_counter}"
-            quote_uri_to_label[quoted_uri] = label
-            q_handle, _, q_ts_dt, q_text = c.quoted
-            quote_table[quoted_uri] = (label, q_handle, q_ts_dt, q_text)
-        post_to_quoted_uri[c.post_obj.uri] = quoted_uri
-
-    # --- Store posts in SQLite and get IDs ---
-
-    at_uris = [c.post_obj.uri for c in selected]
-    ids = _db_store_posts(at_uris)
-    uri_to_id: dict[str, int] = {uri: pid for uri, pid in zip(at_uris, ids)}
-
-    # Build a map of uri -> id for reply-parent lookup
-    uri_in_batch: set[str] = set(at_uris)
-
-    # --- Render rows ---
-
-    rows: list[str] = []
-    row_quote_labels: list[str | None] = []  # aligned with rows
-    for c in selected:
-        post_id = uri_to_id[c.post_obj.uri]
-        author = getattr(c.post_obj, "author", None)
-        handle = author.handle if author else "?"
-        like_count = c.post_obj.like_count or 0
-        if like_count >= notable_threshold and (author and author.display_name and author.display_name != handle):
-            author_field = f"{handle} ({_sanitize_for_row(author.display_name)})"
-        else:
-            author_field = handle
-
-        time_str = _fmt_ts_compact(c.item, since_minutes)
-        total_eng = like_count + (c.post_obj.repost_count or 0) + (c.post_obj.reply_count or 0)
-        if total_eng >= _VIRAL_DROP_THRESHOLD:
-            metrics_str = f"{like_count},{c.post_obj.repost_count or 0},{c.post_obj.reply_count or 0}"
-        else:
-            metrics_str = ""
-
-        # refs: reply and/or quote
-        refs_parts = []
-        record = getattr(c.post_obj, "record", None)
-        if record and hasattr(record, "reply") and record.reply:
-            parent_uri = ""
-            if hasattr(record.reply, "parent") and record.reply.parent:
-                parent_uri = getattr(record.reply.parent, "uri", "")
-            if parent_uri in uri_in_batch:
-                parent_id = uri_to_id.get(parent_uri)
-                if parent_id:
-                    refs_parts.append(f"Re:{parent_id}")
-            else:
-                # Try to get the parent handle from feed_view.reply.
-                # fv_reply.parent may be a BlockedPost / NotFoundPost whose author
-                # lacks .handle (BlockedAuthor only carries did + viewer).
-                reply_parent_handle = None
-                fv_reply = getattr(c.item, "reply", None)
-                if fv_reply and hasattr(fv_reply, "parent"):
-                    pa = getattr(fv_reply.parent, "author", None)
-                    reply_parent_handle = getattr(pa, "handle", None) if pa else None
-                if reply_parent_handle:
-                    refs_parts.append(f"Re:@{reply_parent_handle}")
-
-        quoted_uri = post_to_quoted_uri.get(c.post_obj.uri)
-        label = quote_uri_to_label[quoted_uri] if quoted_uri else None
-        if label:
-            refs_parts.append(f"Q:{label}")
-        row_quote_labels.append(label)
-
-        row_parts = [str(post_id), author_field, time_str]
-        extra_col = (extra_cols or {}).get(c.post_obj.uri)
-        if extra_col:
-            row_parts.append(extra_col)
-        if metrics_str:
-            row_parts.append(metrics_str)
-        if refs_parts:
-            row_parts.append(" ".join(refs_parts))
-        row_parts.append(c.post_text + c.embed_suffix)
-        rows.append("  " + " | ".join(row_parts))
-
-    # --- Render quote table entries ---
+    # --- Quote table (single pass; the first quoting post's text is kept for
+    # the full_when_parent_text_short strategy, so no rescan later) ---
 
     quote_line_by_label: dict[str, str] = {}
-    for quoted_uri, (label, q_handle, q_ts_dt, q_text) in quote_table.items():
-        # Find the parent post text for full_when_parent_text_short strategy
-        parent_text = ""
-        for c in selected:
-            if post_to_quoted_uri.get(c.post_obj.uri) == quoted_uri:
-                parent_text = c.post_text
-                break
-        body = _render_quote_entry(q_handle, "", q_text, quote_strategy, parent_text)
+    quote_uri_to_label: dict[str, str] = {}
+    for c in selected:
+        if not c.quoted or not c.quoted_uri or c.quoted_uri in quote_uri_to_label:
+            continue
+        label = f"Q{len(quote_uri_to_label) + 1}"
+        quote_uri_to_label[c.quoted_uri] = label
+        q_handle, _, q_ts_dt, q_text = c.quoted
+        body = _render_quote_entry(q_handle, "", q_text, quote_strategy, c.post_text)
         entry_parts = [f"  {label}", q_handle]
         if q_ts_dt:
             # Quoted posts often predate the window — always include the day.
@@ -1680,26 +2048,101 @@ def _render_compact_feed(
             entry_parts.append(body)
         quote_line_by_label[label] = " | ".join(entry_parts)
 
+    # --- Row specs (everything but the IDs) ---
+
+    uri_in_batch: set[str] = {c.post_obj.uri for c in selected}
+    specs: list[dict] = []
+    for c in selected:
+        author = getattr(c.post_obj, "author", None)
+        handle = author.handle if author else "?"
+        like_count = c.post_obj.like_count or 0
+        if like_count >= notable_threshold and (author and author.display_name and author.display_name != handle):
+            author_field = f"{handle} ({_sanitize_for_row(author.display_name)})"
+        else:
+            author_field = handle
+
+        total_eng = like_count + (c.post_obj.repost_count or 0) + (c.post_obj.reply_count or 0)
+        metrics_str = (
+            f"{like_count},{c.post_obj.repost_count or 0},{c.post_obj.reply_count or 0}"
+            if total_eng >= _VIRAL_DROP_THRESHOLD else ""
+        )
+
+        # refs: reply and/or quote
+        parent_in_batch = None
+        reply_handle_ref = None
+        record = getattr(c.post_obj, "record", None)
+        if record and hasattr(record, "reply") and record.reply:
+            parent_uri = ""
+            if hasattr(record.reply, "parent") and record.reply.parent:
+                parent_uri = getattr(record.reply.parent, "uri", "")
+            if parent_uri in uri_in_batch:
+                parent_in_batch = parent_uri
+            else:
+                # Try to get the parent handle from feed_view.reply.
+                # fv_reply.parent may be a BlockedPost / NotFoundPost whose author
+                # lacks .handle (BlockedAuthor only carries did + viewer).
+                fv_reply = getattr(c.item, "reply", None)
+                if fv_reply and hasattr(fv_reply, "parent"):
+                    pa = getattr(fv_reply.parent, "author", None)
+                    reply_handle_ref = getattr(pa, "handle", None) if pa else None
+
+        specs.append({
+            "uri": c.post_obj.uri,
+            "head": [author_field, _fmt_ts_compact(c.item, since_minutes)]
+                    + ([extra_cols[c.post_obj.uri]] if extra_cols and extra_cols.get(c.post_obj.uri) else [])
+                    + ([metrics_str] if metrics_str else []),
+            "parent": parent_in_batch,
+            "reply_handle": reply_handle_ref,
+            "label": quote_uri_to_label.get(c.quoted_uri) if c.quoted and c.quoted_uri else None,
+            "text": c.post_text + c.embed_suffix,
+        })
+
+    def render_row(spec, id_of) -> str:
+        refs = []
+        if spec["parent"]:
+            refs.append(f"Re:{id_of(spec['parent'])}")
+        elif spec["reply_handle"]:
+            refs.append(f"Re:@{spec['reply_handle']}")
+        if spec["label"]:
+            refs.append(f"Q:{spec['label']}")
+        parts = [str(id_of(spec["uri"])), *spec["head"]]
+        if refs:
+            parts.append(" ".join(refs))
+        parts.append(spec["text"])
+        return "  " + " | ".join(parts)
+
     # --- Output size cap ---
     # Keep rows newest-first until the budget runs out. A quote entry is
     # charged to the first kept row that references it; labels are assigned in
     # first-reference order, so the kept quotes are always Q1..Qk.
 
-    kept_rows: list[str] = []
+    placeholder = "9" * _ID_WIDTH_ESTIMATE
+    kept: list[dict] = []
     quote_lines: list[str] = []
     kept_labels: set[str] = set()
     used = 0
-    for row, label in zip(rows, row_quote_labels):
+    for spec in specs:
+        label = spec["label"]
         new_quote = label is not None and label not in kept_labels
-        cost = len(row) + 1 + (len(quote_line_by_label[label]) + 1 if new_quote else 0)
-        if kept_rows and used + cost > _RAW_OUTPUT_CHAR_BUDGET:
+        cost = _out_size(render_row(spec, lambda _uri: placeholder)) + 1
+        if new_quote:
+            cost += _out_size(quote_line_by_label[label]) + 1
+        if kept and used + cost > _RAW_OUTPUT_CHAR_BUDGET:
             break
         used += cost
-        kept_rows.append(row)
+        kept.append(spec)
         if new_quote:
             kept_labels.add(label)
             quote_lines.append(quote_line_by_label[label])
-    omitted = len(rows) - len(kept_rows)
+    omitted = len(specs) - len(kept)
+
+    # --- Store kept posts (and the parents they cite) in SQLite, then render ---
+
+    id_uris = list(dict.fromkeys(
+        [s["uri"] for s in kept] + [s["parent"] for s in kept if s["parent"]]
+    ))
+    uri_to_id = dict(zip(id_uris, _db_store_posts(id_uris)))
+    kept_rows = [render_row(spec, uri_to_id.__getitem__) for spec in kept]
 
     # --- Build final output ---
 
@@ -1708,7 +2151,7 @@ def _render_compact_feed(
     eligible_label = f"{eligible_count} eligible"
     if filtered:
         eligible_label += f" ({filtered} too short)"
-    funnel_parts = [f"{raw_count} raw{cap_note}", eligible_label]
+    funnel_parts = [f"{raw_count} raw", eligible_label]
     if shown < eligible_count:
         funnel_parts.append(f"{shown} shown")
     funnel = " → ".join(funnel_parts)
@@ -1719,7 +2162,8 @@ def _render_compact_feed(
     bm_col = "bm:date | " if extra_cols else ""
     header = (
         f"{shown} posts | {funnel}{window_note}\n"
-        f"cols: id | author | time | {bm_col}likes,reposts,replies (if ≥10) | "
+        + _notes_line(notes)
+        + f"cols: id | author | time | {bm_col}likes,reposts,replies (if ≥10) | "
         f"refs (Re:<id|@handle> reply, Q:Qn quote) | text ('¦' = '|')\n"
         f"IDs valid 1h · get_post_by_id(N) for full detail · {URL_TEMPLATE_NOTE}\n"
     )
@@ -1863,23 +2307,36 @@ def _index_top_authors(df, k=6):
             for h, _ in Counter(df.handle).most_common(k)]
 
 
+# Index builds are memory-heavy (dense term x unit matrices on top of the
+# ~200 MB of background artifacts), so concurrent requests queue rather than
+# multiply the peak. One at a time unless configured otherwise.
+_INDEX_BUILD_SLOTS = threading.BoundedSemaphore(max(1, int(os.getenv("MCP_INDEX_CONCURRENCY", "1"))))
+
+
 def _render_index(items, source: str, budget: int, max_posts: int | None = None) -> str:
     """Compress a fetched window into keyqueries. See the section note above."""
     from comp import data, encode, pipeline
 
+    notes = list(getattr(items, "notes", None) or [])
     deduped = _deduplicate_posts(items)
     if max_posts is not None and len(deduped) > max_posts:
         deduped = deduped[:max_posts]
     if not deduped:
-        return "No posts found."
+        return _notes_line(notes) + "No posts found."
 
     df = _postviews_to_frame(deduped)
     bg, priors = _comp_artifacts()
 
-    t0 = time.time()
-    ctx = pipeline.prepare(None, frame=df, bg=bg, priors=priors)
-    result = pipeline.run(None, ctx=ctx, budget=budget)
-    elapsed = time.time() - t0
+    with _INDEX_BUILD_SLOTS:
+        _raise_if_cancelled()
+        t0 = time.time()
+        ctx = pipeline.prepare(None, frame=df, bg=bg, priors=priors)
+        # prefix_budget, not budget: the ranking is built without regard to
+        # cost and cut where it stops fitting, so a larger budget only appends
+        # entries (see select.choose).
+        result = pipeline.run(None, ctx=ctx, choose_kw={"prefix_budget": budget})
+        chosen = result["chosen"]
+        elapsed = time.time() - t0
 
     if source.lower() in ("timeline", "home", "following"):
         scope, source_note = encode.SCOPE_FOLLOWING, None
@@ -1889,92 +2346,183 @@ def _render_index(items, source: str, budget: int, max_posts: int | None = None)
         scope = encode.SCOPE_OTHER
         source_note = (f"Index is of '{source}'; search is global, so expect "
                        f"some hits from outside it.")
+    if notes:
+        source_note = " ".join(filter(None, [source_note, "⚠ " + "; ".join(notes) + "."]))
 
     text = encode.encode(
-        result["chosen"], ctx["units"], data.window(ctx["df"]),
+        chosen, ctx["units"], data.window(ctx["df"]),
         n_posts=len(ctx["df"]), n_authors=ctx["df"].handle.nunique(),
         sep="; ",
-        residual=encode.residual_line(result["chosen"], ctx["units"]),
+        residual=encode.residual_line(chosen, ctx["units"]),
         domains=_index_top_domains(ctx["df"]),
         top_authors=_index_top_authors(ctx["df"]),
         mutuals=_mutuals_present_handles(zip(df.did, df.handle)),
         scope=scope, source_note=source_note,
     )
     log.info("index: %d posts -> %d entries in %.1fs",
-             len(ctx["df"]), len(result["chosen"]), elapsed)
+             len(ctx["df"]), len(chosen), elapsed)
     return text
 
 
 # --- Link card / embed helpers ---
+#
+# Outbound fetches of caller-influenced URLs (link cards, image CDN URLs) go
+# through _public_http, whose transport checks the address it actually
+# connects to. Checking a hostname up front and then letting the HTTP client
+# resolve it again is not enough: another A/AAAA record, an IPv6 answer or a
+# DNS rebind can point the real connection somewhere private.
 
 _USER_AGENT = "Mozilla/5.0 (compatible; bsky-mcp-bot/1.0)"
 _EMBED_RE = re.compile(r"^\[embed:\s*(https?://\S+)\]\s*$", re.MULTILINE)
 _POST_IMAGE_MAX_BYTES = 5_000_000
 _POST_IMAGES_TOTAL_MAX_BYTES = 40_000_000
+# OG tags live in <head>; a page is read up to this much and the rest ignored.
+_LINK_CARD_MAX_BYTES = 1_000_000
+_FETCH_DEADLINE = 20.0  # seconds per fetch, all redirect hops and body included
+
+
+def _is_public_ip(raw: str) -> bool:
+    """True only for globally routable unicast addresses."""
+    try:
+        addr = ipaddress.ip_address(raw.split("%", 1)[0])
+    except ValueError:
+        return False
+    mapped = getattr(addr, "ipv4_mapped", None)
+    if mapped is not None:
+        addr = mapped
+    return addr.is_global and not (
+        addr.is_private or addr.is_loopback or addr.is_link_local
+        or addr.is_multicast or addr.is_reserved or addr.is_unspecified
+    )
+
+
+class _PublicOnlyBackend(httpcore.SyncBackend):
+    """Resolves the host itself, refuses if ANY answer is non-public, then
+    connects to a vetted address. TLS still verifies against the hostname
+    (httpcore passes the origin host as server_hostname to start_tls)."""
+
+    def connect_tcp(self, host, port, timeout=None, local_address=None, socket_options=None):
+        try:
+            infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except OSError as exc:
+            raise httpcore.ConnectError(f"cannot resolve {host}: {exc}") from exc
+        addrs = list(dict.fromkeys(info[4][0] for info in infos))
+        blocked = [a for a in addrs if not _is_public_ip(a)]
+        if not addrs or blocked:
+            raise httpcore.ConnectError(f"refusing non-public address for {host}: {blocked or 'none'}")
+        last_exc: Exception | None = None
+        for addr in addrs:
+            try:
+                return super().connect_tcp(addr, port, timeout=timeout, local_address=local_address,
+                                           socket_options=socket_options)
+            except httpcore.ConnectError as exc:
+                last_exc = exc
+        raise last_exc
+
+
+class _PublicOnlyTransport(httpx.HTTPTransport):
+    def __init__(self):
+        # trust_env=False: an environment proxy would resolve the target itself
+        # and bypass the address check.
+        super().__init__(trust_env=False)
+        # httpx exposes no network_backend option; swap the pool it built for
+        # an equivalent one using the vetting backend.
+        assert isinstance(self._pool, httpcore.ConnectionPool)
+        self._pool = httpcore.ConnectionPool(
+            ssl_context=httpx.create_ssl_context(trust_env=False),
+            network_backend=_PublicOnlyBackend(),
+        )
+
+
+_public_http = httpx.Client(
+    transport=_PublicOnlyTransport(),
+    timeout=httpx.Timeout(10.0, connect=5.0),
+    follow_redirects=False,
+    trust_env=False,
+    headers={"User-Agent": _USER_AGENT, "Accept-Encoding": "identity"},
+)
 
 
 def _is_safe_url(url: str) -> bool:
-    """Return False if the URL resolves to a private/loopback/link-local address."""
+    """Cheap pre-check: http(s) scheme, a host, and not a literal private IP.
+
+    The authoritative address check happens at connect time (_PublicOnlyBackend).
+    """
     try:
         parsed = urlparse(url)
-        if parsed.scheme not in ("http", "https"):
-            return False
-        host = parsed.hostname or ""
-        try:
-            addr = ipaddress.ip_address(host)
-        except ValueError:
-            addr = ipaddress.ip_address(socket.gethostbyname(host))
-        return addr.is_global and not addr.is_private and not addr.is_loopback and not addr.is_link_local
-    except Exception:
+    except ValueError:
         return False
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return False
+    host = parsed.hostname
+    try:
+        ipaddress.ip_address(host.split("%", 1)[0])
+    except ValueError:
+        return True  # a name; vetted when the connection is made
+    return _is_public_ip(host)
 
 
-def _get_validating_redirects(url: str, max_redirects: int = 5) -> httpx.Response:
-    """GET with manual redirect following so every hop is SSRF-checked.
+def _fetch_public(url: str, max_bytes: int, *, truncate: bool = False,
+                  check_headers=None, max_redirects: int = 5) -> tuple[httpx.Response, bytes]:
+    """GET a public URL with redirect, size and time limits enforced while reading.
 
-    follow_redirects=True would only validate the first URL — a public site
-    could 302 to a private/loopback address and bypass _is_safe_url.
+    Redirects are followed by hand so each hop is re-checked. The body is
+    streamed: a declared Content-Length over the limit is refused before any
+    body is read, and the running byte count is checked per chunk, so an
+    oversized or endless response never sits in memory. `truncate=True` stops
+    at max_bytes instead of failing (HTML whose useful part comes first).
+    `check_headers(response)` may raise to reject a response before its body.
     """
+    deadline = time.monotonic() + _FETCH_DEADLINE
     for _ in range(max_redirects + 1):
         if not _is_safe_url(url):
             raise ValueError(f"non-public URL: {url}")
-        resp = _http.get(url, follow_redirects=False, timeout=10, headers={"User-Agent": _USER_AGENT})
-        location = resp.headers.get("location")
-        if resp.status_code in (301, 302, 303, 307, 308) and location:
-            url = str(httpx.URL(url).join(location))
-            continue
-        resp.raise_for_status()
-        return resp
+        with _public_http.stream("GET", url) as resp:
+            location = resp.headers.get("location")
+            if resp.status_code in (301, 302, 303, 307, 308) and location:
+                url = str(httpx.URL(url).join(location))
+                continue
+            resp.raise_for_status()
+            if check_headers:
+                check_headers(resp)
+            try:
+                declared = int(resp.headers.get("content-length", "0"))
+            except ValueError:
+                declared = 0
+            if declared > max_bytes and not truncate:
+                raise ValueError(f"response too large ({declared} bytes; max {max_bytes})")
+            buf = bytearray()
+            for chunk in resp.iter_bytes():
+                buf += chunk
+                if len(buf) > max_bytes:
+                    if truncate:
+                        del buf[max_bytes:]
+                        break
+                    raise ValueError(f"response too large (over {max_bytes} bytes)")
+                if time.monotonic() > deadline:
+                    raise TimeoutError(f"fetch exceeded {_FETCH_DEADLINE:.0f}s: {url}")
+            return resp, bytes(buf)
     raise ValueError(f"too many redirects: {url}")
+
+
+def _check_image_headers(resp: httpx.Response) -> None:
+    mime_type = resp.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if not mime_type.startswith("image/") or mime_type == "image/svg+xml":
+        raise ValueError(f"unexpected image content type: {mime_type or 'missing'}")
 
 
 def _download_post_image(url: str) -> tuple[bytes, str]:
     """Download one API-supplied image URL and validate its type and size."""
-    resp = _get_validating_redirects(url)
+    resp, data = _fetch_public(url, _POST_IMAGE_MAX_BYTES, check_headers=_check_image_headers)
     mime_type = resp.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-    if not mime_type.startswith("image/") or mime_type == "image/svg+xml":
-        raise ValueError(f"unexpected image content type: {mime_type or 'missing'}")
-    try:
-        declared_size = int(resp.headers.get("content-length", "0"))
-    except ValueError:
-        declared_size = 0
-    if declared_size > _POST_IMAGE_MAX_BYTES:
-        raise ValueError(
-            f"image is too large ({declared_size} bytes; max {_POST_IMAGE_MAX_BYTES})"
-        )
-    data = resp.content
-    if len(data) > _POST_IMAGE_MAX_BYTES:
-        raise ValueError(
-            f"image is too large ({len(data)} bytes; max {_POST_IMAGE_MAX_BYTES})"
-        )
     return data, mime_type
 
 
 def _fetch_link_card(url: str) -> dict:
     """Fetch OG title and description for a URL to build a link card embed."""
     try:
-        resp = _get_validating_redirects(url)
-        html = resp.text
+        resp, body = _fetch_public(url, _LINK_CARD_MAX_BYTES, truncate=True)
+        html = body.decode(resp.charset_encoding or "utf-8", errors="replace")
 
         def _meta(prop: str) -> str:
             for pattern in [
@@ -2012,7 +2560,7 @@ def _build_external_embed(url: str) -> models.AppBskyEmbedExternal.Main:
 # --- Rich text facets ---
 # AT Protocol clients never auto-linkify plain text: without explicit facet
 # records (byte ranges into the UTF-8 text), URLs render dead, mentions don't
-# notify, and hashtags aren't tappable. Keep _test_facets.py in sync.
+# notify, and hashtags aren't tappable. _test_facets.py exercises this exact code.
 
 _FACET_URL_RE = re.compile(
     r"https?://[^\s<>\"']+|www\.[^\s<>\"']+|\b[a-z0-9][-a-z0-9.]*\.[a-z]{2,}/[^\s<>\"']*",
@@ -2034,13 +2582,19 @@ def _trim_url_match(url: str) -> str:
     return url
 
 
-def _detect_facets(text: str) -> list[models.AppBskyRichtextFacet.Main] | None:
+def _resolve_handle_did(handle: str) -> str:
+    return client.com.atproto.identity.resolve_handle({"handle": handle}).did
+
+
+def _detect_facets(text: str, resolve_handle=None) -> list[models.AppBskyRichtextFacet.Main] | None:
     """Detect links, mentions, and hashtags; return facets with UTF-8 byte offsets.
 
-    Mentions are resolved to DIDs via the API; handles that fail to resolve
-    are left as plain text. URLs claim their character range first so a #fragment
-    or @ inside a URL is never double-faceted.
+    Mentions are resolved to DIDs via the API (`resolve_handle`, injectable for
+    tests); handles that fail to resolve are left as plain text. URLs claim
+    their character range first so a #fragment or @ inside a URL is never
+    double-faceted.
     """
+    resolve_handle = resolve_handle or _resolve_handle_did
     facets: list[models.AppBskyRichtextFacet.Main] = []
     claimed: list[tuple[int, int]] = []
 
@@ -2071,7 +2625,7 @@ def _detect_facets(text: str) -> list[models.AppBskyRichtextFacet.Main] | None:
             continue
         handle = m.group(1)
         try:
-            did = client.com.atproto.identity.resolve_handle({"handle": handle}).did
+            did = resolve_handle(handle)
         except Exception:
             log.info("Mention @%s did not resolve; leaving as plain text", handle)
             continue
@@ -2172,6 +2726,28 @@ _ARG_ALIASES: dict[str, dict] = {
     "get_notifications": _SINCE_HOURS_ALIAS,
     "get_messages": _SINCE_HOURS_ALIAS,
 }
+
+
+class _SessionGuard(Middleware):
+    """Sign in, refresh, or replace a dead session before every tool call.
+
+    Covers a login that failed at startup (Bluesky down, rate limited: the
+    server stays up and retries here, with backoff), and repairs a session the
+    server has invalidated before SDK-only tools run into it — _ensure_session
+    otherwise only runs ahead of raw XRPC and chat calls. A transient failure
+    with a session in hand is logged and the call goes ahead; the tool's own
+    requests then succeed or report the error themselves.
+    """
+
+    async def on_call_tool(self, context: MiddlewareContext, call_next):
+        try:
+            await asyncio.to_thread(_ensure_session)
+        except Exception as exc:
+            if client.me is None:
+                raise ToolError(f"Not signed in to Bluesky: {_brief_error(exc)}") from exc
+            log.warning("Session check before %s failed (%s); trying the call anyway",
+                        context.message.name, _brief_error(exc))
+        return await call_next(context)
 
 
 class _ClientArgShim(Middleware):
@@ -2280,7 +2856,7 @@ mcp = FastMCP(
     "bluesky",
     instructions=_SERVER_INSTRUCTIONS,
     version=__version__,
-    middleware=[_ClientArgShim()],
+    middleware=[_SessionGuard(), _ClientArgShim()],
     auth=_build_auth(),
 )
 
@@ -2387,29 +2963,20 @@ _ANN_DESTRUCTIVE = {
 async def list_sources(ctx: Context = None) -> str:
     """List the saved feeds and curation lists usable as get_posts(source=...)."""
     async with _heartbeat(ctx):
-        return await asyncio.to_thread(_list_sources_impl)
+        return await _run_tool(_list_sources_impl)
 
 
 def _list_sources_impl() -> str:
-    prefs = _get_raw_preferences()
-    generator_uris = _extract_saved_feed_uris(prefs)
-
     feed_lines = []
-    feed_cache.clear()
-    for i in range(0, len(generator_uris), 25):
-        batch = generator_uris[i : i + 25]
-        resp = client.app.bsky.feed.get_feed_generators({"feeds": batch})
-        for gen in resp.feeds:
-            name = gen.display_name or gen.uri
-            key = _unique_cache_key(feed_cache, name, gen.uri)
-            feed_cache[key] = gen.uri
-            desc = getattr(gen, "description", "") or ""
-            desc_line = f"  {_truncate(desc, 100)}" if desc else ""
-            # Show the disambiguated cache key for duplicate names — it's the
-            # name get_posts actually resolves; the bare name only reaches the
-            # first duplicate.
-            label = name if key == name.lower() else key
-            feed_lines.append(f"- {label} ({gen.uri}){desc_line}")
+    for key, gen in refresh_feed_cache():
+        name = gen.display_name or gen.uri
+        desc = getattr(gen, "description", "") or ""
+        desc_line = f"  {_truncate(desc, 100)}" if desc else ""
+        # Show the disambiguated cache key for duplicate names — it's the
+        # name get_posts actually resolves; the bare name only reaches the
+        # first duplicate.
+        label = name if key == name.lower() else key
+        feed_lines.append(f"- {label} ({gen.uri}){desc_line}")
 
     list_lines = []
     for key, lst in refresh_list_cache():
@@ -2480,7 +3047,7 @@ def _render_raw_profile_row(profile: dict) -> str:
 )
 async def get_list(
     list_ref: str,
-    limit: int = 100,
+    limit: Annotated[int, Field(ge=1, le=5000)] = 100,
     ctx: Context = None,
 ) -> str:
     """Read a list by saved name or AT URI and return its members.
@@ -2489,7 +3056,7 @@ async def get_list(
     handle | display name | relationship flags | follower count | DID | description.
     """
     async with _heartbeat(ctx):
-        return await asyncio.to_thread(_get_list_impl, list_ref, limit)
+        return await _run_tool(_get_list_impl, list_ref, limit)
 
 
 def _get_list_impl(list_ref: str, limit: int) -> str:
@@ -2631,7 +3198,7 @@ async def add_list_members(
     reported without discarding successful additions.
     """
     async with _heartbeat(ctx):
-        return await asyncio.to_thread(_add_list_members_impl, list_ref, actors)
+        return await _run_tool(_add_list_members_impl, list_ref, actors)
 
 
 def _add_list_members_impl(list_ref, actors) -> str:
@@ -2679,16 +3246,17 @@ async def remove_list_members(
     """Batch-remove handles or DIDs from an owned list.
 
     Every underlying membership record is deleted, including accidental
-    duplicates. Accounts that are not members and inputs that do not resolve
-    are reported separately.
+    duplicates. A DID is used as given, so deactivated or deleted accounts can
+    still be removed. Accounts that are not members and inputs that do not
+    resolve are reported separately.
     """
     async with _heartbeat(ctx):
-        return await asyncio.to_thread(_remove_list_members_impl, list_ref, actors)
+        return await _run_tool(_remove_list_members_impl, list_ref, actors)
 
 
 def _remove_list_members_impl(list_ref, actors) -> str:
     uri, _rkey, _current = _owned_list_record(list_ref)
-    resolved, failed, duplicates = _resolve_actor_inputs(actors)
+    resolved, failed, duplicates = _resolve_removal_inputs(actors)
     index = _listitem_index()
     targets: list[tuple[dict, str]] = []
     missing = []
@@ -2739,7 +3307,7 @@ async def delete_list(
     reported so the caller can clean those up separately.
     """
     async with _heartbeat(ctx):
-        return await asyncio.to_thread(_delete_list_impl, list_ref)
+        return await _run_tool(_delete_list_impl, list_ref)
 
 
 def _delete_list_impl(list_ref: str) -> str:
@@ -2751,8 +3319,11 @@ def _delete_list_impl(list_ref: str) -> str:
     except Exception:
         pass
     try:
-        if any(uri in json.dumps(record.get("value") or {}) for record in _raw_repo_records("app.bsky.graph.starterpack", 5000)):
+        packs, complete = _raw_repo_records("app.bsky.graph.starterpack", 5000)
+        if any(uri in json.dumps(record.get("value") or {}) for record in packs):
             refs.append("starter packs")
+        elif not complete:
+            refs.append("possibly starter packs (not all were checked)")
     except Exception:
         pass
 
@@ -2842,7 +3413,7 @@ async def add_mutuals(
     are reported and skipped. note is an optional label applied to all of them.
     """
     async with _heartbeat(ctx):
-        return await asyncio.to_thread(_add_mutuals_impl, handles, note)
+        return await _run_tool(_add_mutuals_impl, handles, note)
 
 
 def _add_mutuals_impl(handles, note) -> str:
@@ -2924,6 +3495,10 @@ FeedLimit = Annotated[int | None, Field(
 MinChars = Annotated[int, Field(
     ge=0, description="Drop posts with less text than this; link-card posts are exempt.",
 )]
+# A list of strings, or one comma-separated string: clients and models send
+# both, and _v2_list normalizes either. No Field description, so each
+# parameter keeps its own Args: entry.
+StrList = list[str] | str | None
 QuoteMode = Annotated[_QuoteStrategy, Field(
     description="How much of each quoted post the 'quotes:' table shows.",
 )]
@@ -2933,12 +3508,14 @@ def _fetch_scope(fetcher, limit, since_minutes, min_chars):
     """Fetch the scoped candidate set for a feed-shaped tool.
 
     since_minutes bounds the window (all of it if limit is unset); limit caps
-    the result to the newest N. Returns (items, effective_max_posts).
+    the result to the newest N eligible posts. A fetcher marked
+    `chronological` may end its window at the first all-old page (see
+    fetch_by_time). Returns (items, effective_max_posts).
     """
     if since_minutes is not None:
-        # fetch_by_time clamps to _TIME_FETCH_CAP; an explicit limit narrows
-        # the scope to the newest N, so only fetch that much.
-        return fetch_by_time(fetcher, since_minutes, max_items=limit), limit
+        items = fetch_by_time(fetcher, since_minutes, max_items=limit, min_chars=min_chars,
+                              ordered=getattr(fetcher, "chronological", False))
+        return items, limit
     count = limit if limit is not None else 50
     return fetch_by_count(fetcher, count, min_chars=min_chars), count
 
@@ -2962,6 +3539,7 @@ def _resolve_source(source: str):
             if cursor:
                 params["cursor"] = cursor
             return client.app.bsky.feed.get_timeline(params)
+        fetcher.chronological = True
         return fetcher
 
     if source.startswith("at://"):
@@ -2969,9 +3547,10 @@ def _resolve_source(source: str):
         kind = "list" if "/app.bsky.graph.list/" in uri else "feed"
     else:
         key = source.lower()
+        feed_gen, list_gen = _cache_gen["feed"], _cache_gen["list"]
         if key not in feed_cache and key not in list_cache:
-            refresh_feed_cache()
-            refresh_list_cache()
+            _refresh_on_miss("feed", feed_gen)
+            _refresh_on_miss("list", list_gen)
         if key in feed_cache:
             uri, kind = feed_cache[key], "feed"
         elif key in list_cache:
@@ -2990,7 +3569,9 @@ def _resolve_source(source: str):
             if cursor:
                 params["cursor"] = cursor
             return client.app.bsky.feed.get_list_feed(params)
+        fetcher.chronological = True  # list feeds are reverse-chronological
     else:
+        # Feed generators rank however they like: never chronological.
         def fetcher(cursor=None, limit=100):
             params = {"feed": uri, "limit": limit}
             if cursor:
@@ -3008,7 +3589,7 @@ async def get_posts(
     limit: FeedLimit = None,
     source: str = "timeline",
     mode: _FeedMode = "raw",
-    budget: int = 400,
+    budget: Annotated[int, Field(ge=1, le=20000)] = 400,
     min_chars: MinChars = 10,
     quote: QuoteMode = "truncated_120",
     ctx: Context = None,
@@ -3035,7 +3616,7 @@ async def get_posts(
             does not reorder or expand existing entries.
     """
     async with _heartbeat(ctx):
-        return await asyncio.to_thread(
+        return await _run_tool(
             _get_posts_impl, source, since_minutes, limit, mode, budget, min_chars, quote
         )
 
@@ -3115,7 +3696,7 @@ async def get_post_images(
             originally uploaded blob.
     """
     async with _heartbeat(ctx):
-        return await asyncio.to_thread(_get_post_images_impl, post_id, size)
+        return await _run_tool(_get_post_images_impl, post_id, size)
 
 
 def _get_post_images_impl(post_id: int, size: str):
@@ -3183,8 +3764,8 @@ def _get_post_images_impl(post_id: int, size: str):
 )
 async def get_thread(
     uri: str,
-    depth: int = 20,
-    parent_height: int = 6,
+    depth: Annotated[int, Field(ge=0, le=1000)] = 20,
+    parent_height: Annotated[int, Field(ge=0, le=1000)] = 6,
     full: bool = False,
     ctx: Context = None,
 ) -> str:
@@ -3198,7 +3779,7 @@ async def get_thread(
             levels); ignores depth/parent_height.
     """
     async with _heartbeat(ctx):
-        return await asyncio.to_thread(_get_thread_impl, uri, depth, parent_height, full)
+        return await _run_tool(_get_thread_impl, uri, depth, parent_height, full)
 
 
 def _get_thread_impl(uri, depth, parent_height, full):
@@ -3232,43 +3813,64 @@ def _format_thread_parent_chain(node) -> str:
     return _join_thread_blocks(format_post_text(parent) for parent in chain)
 
 
-def _format_thread_node_text(node, level=0, include_parent_chain=True, reply_parent=None) -> str:
-    """Recursively format a thread node as compact text."""
-    if hasattr(node, "not_found") and node.not_found:
-        return "[Post not found]\n"
-    if hasattr(node, "blocked") and node.blocked:
-        return "[Post blocked]\n"
+def _thread_node_block(node, reply_parent=None) -> str:
+    """One thread node as a text block (or a placeholder for a missing node)."""
+    if getattr(node, "not_found", False):
+        return "[Post not found]"
+    if getattr(node, "blocked", False):
+        return "[Post blocked]"
     if not hasattr(node, "post"):
-        return "[Unknown thread node]\n"
+        return "[Unknown thread node]"
+    return format_post_text(node, reply_parent=reply_parent)
 
-    parts = []
 
-    if include_parent_chain and level == 0 and hasattr(node, "parent") and node.parent:
+def _format_thread_node_text(node, include_parent_chain=True) -> str:
+    """Format a thread as text: parent chain, the post, then its replies.
+
+    Replies are walked depth-first with an explicit stack — full=True asks for
+    1000 reply levels, deeper than Python's recursion limit — and emitted in
+    the same preorder as before, joined by '---'. Output stops at the compact
+    renderer's size budget with a count of the posts left out, because a long
+    thread can exceed the client's tool-result limit on its own.
+    """
+    if not hasattr(node, "post"):
+        return _thread_node_block(node)
+
+    head: list[str] = []
+    if include_parent_chain and getattr(node, "parent", None):
         parents = _format_thread_parent_chain(node.parent)
         if parents:
-            parts.append(parents)
-            parts.append("[CONTINUED IN THREAD]")
+            head += [parents, "[CONTINUED IN THREAD]"]
+    root_block = format_post_text(node)
+    root_replies = list(getattr(node, "replies", None) or [])
+    if root_replies:
+        root_block += f"\n{SEP_POST}\nREPLIES ({len(root_replies)})"
+    head.append(root_block)
 
-    body = format_post_text(node, reply_parent=reply_parent)
-
-    if hasattr(node, "replies") and node.replies:
-        replies = [
-            _format_thread_node_text(
-                reply,
-                level=level + 1,
-                include_parent_chain=False,
-                reply_parent=node,
-            )
-            for reply in node.replies
-        ]
-        if level == 0:
-            body = body + f"\n{SEP_POST}\nREPLIES ({len(node.replies)})\n{SEP_POST}\n" + _join_thread_blocks(replies)
+    blocks: list[str] = []
+    used = sum(_out_size(b) + len(SEP_POST) + 2 for b in head)
+    omitted = 0
+    stack = [(reply, node) for reply in reversed(root_replies)]
+    while stack:
+        current, parent = stack.pop()
+        if omitted:
+            omitted += 1  # past the cap: only count, so the output has no gaps
         else:
-            body = _join_thread_blocks([body, *replies])
-
-    parts.append(body)
-
-    return _join_thread_blocks(parts)
+            block = _thread_node_block(current, reply_parent=parent)
+            cost = _out_size(block) + len(SEP_POST) + 2
+            if blocks and used + cost > _RAW_OUTPUT_CHAR_BUDGET:
+                omitted = 1
+            else:
+                used += cost
+                blocks.append(block)
+        if hasattr(current, "post"):
+            stack.extend((reply, current) for reply in reversed(getattr(current, "replies", None) or []))
+    text = _join_thread_blocks(head + blocks)
+    if omitted:
+        text += (f"\n{SEP_POST}\n… {omitted} more repl{'ies' if omitted != 1 else 'y'} not shown "
+                 "(output size cap); read a branch with get_thread(uri=bsky.app/profile/"
+                 "<handle>/post/<rk>) of the last reply shown.")
+    return text
 
 
 @mcp.tool(
@@ -3276,7 +3878,7 @@ def _format_thread_node_text(node, level=0, include_parent_chain=True, reply_par
     annotations={"title": "Fetch notifications", **_ANN_READ_ONLY},
 )
 async def get_notifications(
-    limit: int | None = None,
+    limit: Annotated[int | None, Field(ge=1, le=5000)] = None,
     since_minutes: SinceMinutes = None,
     reasons: list[NotificationReason] | None = None,
     ctx: Context = None,
@@ -3288,7 +3890,7 @@ async def get_notifications(
         reasons: Only these notification types; omit for all.
     """
     async with _heartbeat(ctx):
-        return await asyncio.to_thread(
+        return await _run_tool(
             _get_notifications_impl, limit, since_minutes, reasons
         )
 
@@ -3391,7 +3993,7 @@ def get_profile(handle: str) -> str:
 )
 async def search_actors(
     query: str | None = None,
-    limit: int = 25,
+    limit: Annotated[int, Field(ge=1, le=1000)] = 25,
     ctx: Context = None,
 ) -> str:
     """Find Bluesky accounts by handle, display name, or profile text.
@@ -3401,7 +4003,7 @@ async def search_actors(
     relationship flags and DIDs so another tool can act on selected accounts.
     """
     async with _heartbeat(ctx):
-        return await asyncio.to_thread(_search_actors_impl, query, limit)
+        return await _run_tool(_search_actors_impl, query, limit)
 
 
 def _search_actors_impl(query: str | None, limit: int) -> str:
@@ -3438,7 +4040,7 @@ def _search_actors_impl(query: str | None, limit: int) -> str:
 )
 async def get_known_followers(
     actor: str,
-    limit: int = 100,
+    limit: Annotated[int, Field(ge=1, le=1000)] = 100,
     ctx: Context = None,
 ) -> str:
     """Return people the authenticated user follows who also follow actor.
@@ -3448,7 +4050,7 @@ async def get_known_followers(
     with relationship flags and DIDs.
     """
     async with _heartbeat(ctx):
-        return await asyncio.to_thread(_get_known_followers_impl, actor, limit)
+        return await _run_tool(_get_known_followers_impl, actor, limit)
 
 
 def _get_known_followers_impl(actor: str, limit: int) -> str:
@@ -3492,7 +4094,7 @@ def _get_known_followers_impl(actor: str, limit: int) -> str:
 )
 async def get_author_posts(
     actor: str,
-    limit: int = 50,
+    limit: Annotated[int, Field(ge=1, le=1000)] = 50,
     include_replies: bool = True,
     include_reposts: bool = False,
     min_chars: MinChars = 0,
@@ -3510,7 +4112,7 @@ async def get_author_posts(
             authored; on to mirror its public profile feed.
     """
     async with _heartbeat(ctx):
-        return await asyncio.to_thread(
+        return await _run_tool(
             _get_author_posts_impl,
             actor,
             limit,
@@ -3683,23 +4285,23 @@ def _xrpc_error_message(exc: httpx.HTTPStatusError) -> str:
 )
 async def search_posts(
     query: str | None = None,
-    limit: int = 25,
+    limit: Annotated[int, Field(ge=1, le=2000)] = 25,
     sort: Literal["recent", "top"] = "recent",
     following: bool = False,
-    authors: list[str] | None = None,
-    exclude_authors: list[str] | None = None,
-    mentions: list[str] | None = None,
-    hashtags: list[str] | None = None,
-    exclude_hashtags: list[str] | None = None,
-    domains: list[str] | None = None,
-    urls: list[str] | None = None,
-    languages: list[str] | None = None,
+    authors: StrList = None,
+    exclude_authors: StrList = None,
+    mentions: StrList = None,
+    hashtags: StrList = None,
+    exclude_hashtags: StrList = None,
+    domains: StrList = None,
+    urls: StrList = None,
+    languages: StrList = None,
     has_media: bool | None = None,
     has_video: bool | None = None,
     exclude_replies: bool = False,
     replies_only: bool = False,
     thread_root_uri: str | None = None,
-    since_hours: float | None = None,
+    since_hours: Annotated[float | None, Field(gt=0)] = None,
     since: str | None = None,
     until: str | None = None,
     all_time: bool = False,
@@ -3711,7 +4313,8 @@ async def search_posts(
 
     Supply a query, at least one filter, or both: following=True alone browses
     recent posts from followed accounts. A list filter ORs its values; different
-    filters AND together. Only a recent window (about a month) is searched
+    filters AND together; list filters take a list or a comma-separated
+    string. Only a recent window (about a month) is searched
     unless all_time=True; a search that matches nothing there is retried once
     against the full index and the header says so, so an empty result means
     nothing matched. Same compact rows and post IDs as get_posts.
@@ -3744,7 +4347,7 @@ async def search_posts(
         all_time: Search the full index instead of the recent window.
     """
     async with _heartbeat(ctx):
-        return await asyncio.to_thread(
+        return await _run_tool(
             _search_posts_impl, query, limit, sort, following,
             authors,
             exclude_authors, mentions, hashtags, exclude_hashtags, domains, urls,
@@ -3905,7 +4508,9 @@ async def create_post(
     """Create a new post or reply.
 
     URLs, @mentions, and #hashtags in the text are automatically converted to
-    rich-text facets so they are clickable in Bluesky clients.
+    rich-text facets so they are clickable in Bluesky clients. A call identical
+    to one that already published within the hour (same text, reply target
+    and link) returns that post instead of publishing a duplicate.
 
     Args:
         text: Post text, 300 graphemes or fewer.
@@ -3913,21 +4518,50 @@ async def create_post(
         embed_url: URL to embed as a link card (fetches OG title/description automatically).
     """
     async with _heartbeat(ctx):
-        return await asyncio.to_thread(_create_post_impl, text, reply_to_uri, embed_url)
+        return await _run_tool(_create_post_impl, text, reply_to_uri, embed_url)
+
+
+def _publish_key(*parts) -> str:
+    """Stable identity of a publish call, for the retry journal."""
+    return hashlib.sha256("\x1f".join(p or "" for p in parts).encode("utf-8")).hexdigest()
+
+
+def _post_record_exists(uri: str) -> bool:
+    """Ask the PDS (no AppView indexing lag) whether a post record exists."""
+    repo, collection, rkey = _record_uri_parts(uri)
+    try:
+        _xrpc_get("com.atproto.repo.getRecord", {"repo": repo, "collection": collection, "rkey": rkey})
+        return True
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code in (400, 404) and "RecordNotFound" in exc.response.text:
+            return False
+        raise
+
+
+def _post_url(uri: str) -> str:
+    return f"https://bsky.app/profile/{BSKY_HANDLE}/post/{uri.split('/')[-1]}"
 
 
 def _create_post_impl(text, reply_to_uri, embed_url):
     _validate_post_text(text)
 
     reply_ref = _resolve_reply_ref(reply_to_uri) if reply_to_uri else None
+    action = "Reply" if reply_to_uri else "Post"
+    # A client that times out and retries would otherwise post twice: the
+    # first call keeps running to completion after the client gives up.
+    op_key = _publish_key("post", text, reply_ref.parent.uri if reply_ref else "", embed_url)
+    earlier = _journal_lookup(op_key).get(0)
+    if earlier and _post_record_exists(earlier[0]):
+        return (f"{action} was already published by an identical earlier call; not posted again "
+                f"(change the text to post it anyway).\nURI: {earlier[0]}\nURL: {_post_url(earlier[0])}")
+
     embed = _build_external_embed(embed_url) if embed_url else None
     facets = _detect_facets(text)
 
+    _raise_if_cancelled("nothing was published")
     resp = client.send_post(text=text, reply_to=reply_ref, embed=embed, facets=facets)
-    rkey = resp.uri.split("/")[-1]
-    url = f"https://bsky.app/profile/{BSKY_HANDLE}/post/{rkey}"
-    action = "Reply" if reply_to_uri else "Post"
-    return f"{action} created successfully.\nURI: {resp.uri}\nURL: {url}"
+    _journal_record(op_key, 0, resp.uri, resp.cid)
+    return f"{action} created successfully.\nURI: {resp.uri}\nURL: {_post_url(resp.uri)}"
 
 
 @mcp.tool(
@@ -3954,9 +4588,12 @@ async def create_thread(text: str, ctx: Context = None) -> str:
         ---
 
         Third and final post.
+
+    If an identical earlier call was interrupted part-way (a client timeout,
+    say), its published posts are reused and only the rest are posted.
     """
     async with _heartbeat(ctx):
-        return await asyncio.to_thread(_create_thread_impl, text)
+        return await _run_tool(_create_thread_impl, text)
 
 
 def _create_thread_impl(text: str) -> str:
@@ -3975,44 +4612,55 @@ def _create_thread_impl(text: str) -> str:
         _validate_post_text(post_text, label=f"Post {i + 1}")
         parsed.append((post_text, embed_url))
 
-    posts_out = []
-    root_uri: str | None = None
-    root_cid: str | None = None
-    parent_uri: str | None = None
-    parent_cid: str | None = None
+    # Journal each published post, so a retry of the same call after a client
+    # timeout or cancellation resumes the chain instead of duplicating it.
+    op_key = _publish_key("thread", *(f"{body}\x1e{url or ''}" for body, url in parsed))
+    journal = _journal_lookup(op_key)
+    published: list[tuple[str, str]] = []  # (uri, cid) in thread order
+    while len(published) in journal and _post_record_exists(journal[len(published)][0]):
+        published.append(journal[len(published)])
+    if len(published) < len(journal):
+        _journal_forget(op_key, len(published))  # deleted since; republish from there
+    resumed = len(published)
 
-    for i, (post_text, embed_url) in enumerate(parsed):
-        embed = _build_external_embed(embed_url) if embed_url else None
-        facets = _detect_facets(post_text)
+    def urls() -> str:
+        return "\n".join(f"  {i + 1}. {_post_url(uri)}" for i, (uri, _cid) in enumerate(published))
 
-        if parent_uri is None:
-            reply_ref = None
-        else:
-            # Build reply ref directly from cached root/parent — no extra API call needed
-            reply_ref = models.AppBskyFeedPost.ReplyRef(
-                root=models.ComAtprotoRepoStrongRef.Main(uri=root_uri, cid=root_cid),
-                parent=models.ComAtprotoRepoStrongRef.Main(uri=parent_uri, cid=parent_cid),
-            )
-
+    for i in range(resumed, len(parsed)):
+        post_text, embed_url = parsed[i]
+        # Everything after the first post is inside the try: whatever fails,
+        # the caller learns which posts are already live.
         try:
+            embed = _build_external_embed(embed_url) if embed_url else None
+            facets = _detect_facets(post_text)
+
+            reply_ref = None
+            if published:
+                # Build reply ref directly from cached root/parent — no extra API call needed
+                (root_uri, root_cid), (parent_uri, parent_cid) = published[0], published[-1]
+                reply_ref = models.AppBskyFeedPost.ReplyRef(
+                    root=models.ComAtprotoRepoStrongRef.Main(uri=root_uri, cid=root_cid),
+                    parent=models.ComAtprotoRepoStrongRef.Main(uri=parent_uri, cid=parent_cid),
+                )
+
+            _raise_if_cancelled(f"thread stopped after {len(published)}/{len(parsed)} posts "
+                                f"(a retry of the same call resumes it):\n{urls() or '  (none)'}")
             resp = client.send_post(text=post_text, reply_to=reply_ref, embed=embed, facets=facets)
+        except _Cancelled:
+            raise
         except Exception as e:
-            published = "\n".join(posts_out) if posts_out else "  (none)"
             raise ValueError(
-                f"Thread publish failed at post {i + 1}/{len(parsed)}: {e}\n"
-                f"Posts already published (NOT rolled back):\n{published}"
+                f"Thread publish failed at post {i + 1}/{len(parsed)}: {_brief_error(e)}\n"
+                f"Posts already published (NOT rolled back; retrying the same call "
+                f"continues from here):\n{urls() or '  (none)'}"
             ) from e
-        rkey = resp.uri.split("/")[-1]
-        url = f"https://bsky.app/profile/{BSKY_HANDLE}/post/{rkey}"
-        posts_out.append(f"  {i + 1}. {url}")
+        published.append((resp.uri, resp.cid))
+        _journal_record(op_key, i, resp.uri, resp.cid)
 
-        if root_uri is None:
-            root_uri = resp.uri
-            root_cid = resp.cid
-        parent_uri = resp.uri
-        parent_cid = resp.cid
-
-    return f"Thread of {len(posts_out)} posts published:\n" + "\n".join(posts_out)
+    if resumed == len(parsed):
+        return f"Thread of {len(published)} posts was already published by an identical earlier call:\n{urls()}"
+    note = f" (posts 1-{resumed} reused from an interrupted earlier call)" if resumed else ""
+    return f"Thread of {len(published)} posts published{note}:\n{urls()}"
 
 
 # --- Bookmarks ---
@@ -4023,8 +4671,8 @@ def _create_thread_impl(text: str) -> str:
     annotations={"title": "Fetch your bookmarks", **_ANN_READ_ONLY},
 )
 async def get_bookmarks(
-    limit: int = 50,
-    page: int = 1,
+    limit: Annotated[int, Field(ge=1, le=1000)] = 50,
+    page: Annotated[int, Field(ge=1)] = 1,
     quote: QuoteMode = "truncated_120",
     ctx: Context = None,
 ) -> str:
@@ -4040,47 +4688,61 @@ async def get_bookmarks(
         page: 1-based page number.
     """
     async with _heartbeat(ctx):
-        return await asyncio.to_thread(_get_bookmarks_impl, limit, page, quote)
+        return await _run_tool(_get_bookmarks_impl, limit, page, quote)
 
 
-_BOOKMARK_ENUM_CAP = 5000  # safety cap when enumerating the full bookmark list
+# The full list is enumerated (100 per call) for an exact total and stable
+# pages. Up to _BOOKMARK_ENUM_CAP is read on every call; a deeper page extends
+# the scan as far as it needs, up to the hard cap. The result is kept for a
+# couple of minutes so walking pages 1..N does not rescan N times, and so page
+# boundaries hold still while the caller walks them; delete_bookmarks drops it.
+_BOOKMARK_ENUM_CAP = 5000
+_BOOKMARK_HARD_CAP = 50000
+_BOOKMARK_SNAPSHOT_TTL = 120.0
+_bookmark_snapshot: dict = {}  # empty = nothing loaded yet
+_bookmark_lock = threading.Lock()
+
+
+def _invalidate_bookmarks() -> None:
+    with _bookmark_lock:
+        _bookmark_snapshot.clear()
+
+
+def _bookmark_records(need: int) -> tuple[list[tuple[str, datetime | None]], bool]:
+    """(uri, bookmarked_at) newest first, deduplicated, and whether that is all of them."""
+    with _bookmark_lock:
+        snap = _bookmark_snapshot
+        if not snap or time.monotonic() - snap["at"] > _BOOKMARK_SNAPSHOT_TTL:
+            snap.clear()
+            snap.update(at=time.monotonic(), records=[], seen=set(), cursor=None, complete=False)
+        target = min(max(need, _BOOKMARK_ENUM_CAP), _BOOKMARK_HARD_CAP)
+        while not snap["complete"] and len(snap["records"]) < target:
+            _raise_if_cancelled()
+            params: dict = {"limit": 100}
+            if snap["cursor"]:
+                params["cursor"] = snap["cursor"]
+            data = _xrpc_get("app.bsky.bookmark.getBookmarks", params)
+            raw = data.get("bookmarks", [])
+            for bm in raw:
+                uri = (bm.get("subject") or {}).get("uri", "")
+                if uri and uri not in snap["seen"]:
+                    snap["seen"].add(uri)
+                    snap["records"].append((uri, _parse_ts(bm.get("createdAt"))))
+            cursor = data.get("cursor")
+            if not raw or not cursor or cursor == snap["cursor"]:
+                snap["complete"] = True
+            snap["cursor"] = cursor
+        return list(snap["records"]), snap["complete"]
 
 
 def _get_bookmarks_impl(limit, page, quote):
     limit = max(1, limit)
     page = max(1, page)
 
-    # Enumerate the full bookmark list (100 per XRPC call) so we can report
-    # the true total and slice stable pages out of it.
-    bookmarks = []
-    cursor = None
-    enum_capped = False
-    while True:
-        params: dict = {"limit": 100}
-        if cursor:
-            params["cursor"] = cursor
-        data = _xrpc_get("app.bsky.bookmark.getBookmarks", params)
-        raw = data.get("bookmarks", [])
-        bookmarks.extend(raw)
-        cursor = data.get("cursor")
-        if not raw or not cursor:
-            break
-        if len(bookmarks) >= _BOOKMARK_ENUM_CAP:
-            enum_capped = True
-            break
-
-    if not bookmarks:
+    records, complete = _bookmark_records(page * limit)
+    if not records:
         return "No bookmarks found."
-
-    # Preserve bookmark order (newest first), dropping duplicates.
-    # records: (uri, bookmark_created_at_datetime_or_None)
-    records: list[tuple[str, datetime | None]] = []
-    seen: set[str] = set()
-    for bm in bookmarks:
-        uri = bm.get("subject", {}).get("uri", "")
-        if uri and uri not in seen:
-            records.append((uri, _parse_ts(bm.get("createdAt"))))
-            seen.add(uri)
+    enum_capped = not complete
 
     total = len(records)
     pages_total = (total + limit - 1) // limit
@@ -4088,9 +4750,11 @@ def _get_bookmarks_impl(limit, page, quote):
     start = (page - 1) * limit
     page_records = records[start : start + limit]
     if not page_records:
+        beyond = (f" Only the newest {_BOOKMARK_HARD_CAP} bookmarks are reachable."
+                  if enum_capped and total >= _BOOKMARK_HARD_CAP else "")
         return (
             f"Page {page} is out of range: {total_label} bookmarks "
-            f"= {pages_total} page{'s' if pages_total != 1 else ''} of {limit}."
+            f"= {pages_total} page{'s' if pages_total != 1 else ''} of {limit}.{beyond}"
         )
 
     def _bm_date(dt: datetime | None) -> str:
@@ -4154,7 +4818,7 @@ async def delete_bookmarks(
         uris: AT URIs (at://...) or bsky.app post URLs.
     """
     async with _heartbeat(ctx):
-        return await asyncio.to_thread(_delete_bookmarks_impl, ids or [], uris or [])
+        return await _run_tool(_delete_bookmarks_impl, ids or [], uris or [])
 
 
 def _delete_bookmarks_impl(ids: list[int], uris: list[str]) -> str:
@@ -4179,12 +4843,14 @@ def _delete_bookmarks_impl(ids: list[int], uris: list[str]) -> str:
 
     deleted: list[str] = []
     failed: list[tuple[str, str]] = []
+    _invalidate_bookmarks()
     for at_uri in dict.fromkeys(targets):  # dedupe, preserve order
+        _raise_if_cancelled(f"deleted {len(deleted)} bookmarks before stopping: {deleted}")
         try:
             _xrpc_post("app.bsky.bookmark.deleteBookmark", {"uri": at_uri})
             deleted.append(at_uri)
         except Exception as e:
-            failed.append((at_uri, str(e)))
+            failed.append((at_uri, _brief_error(e)))
 
     lines = [f"Deleted {len(deleted)} bookmark{'s' if len(deleted) != 1 else ''}."]
     if failed:
@@ -4207,10 +4873,10 @@ def _delete_bookmarks_impl(ids: list[int], uris: list[str]) -> str:
     output_schema=None,
     annotations={"title": "Fetch your drafts", **_ANN_READ_ONLY},
 )
-async def get_drafts(limit: int = 50, ctx: Context = None) -> str:
+async def get_drafts(limit: Annotated[int, Field(ge=1, le=5000)] = 50, ctx: Context = None) -> str:
     """Fetch your saved drafts."""
     async with _heartbeat(ctx):
-        return await asyncio.to_thread(_get_drafts_impl, limit)
+        return await _run_tool(_get_drafts_impl, limit)
 
 
 def _get_drafts_impl(limit):
@@ -4350,7 +5016,7 @@ async def update_draft(
     an unknown ID. Nothing is published.
     """
     async with _heartbeat(ctx):
-        return await asyncio.to_thread(
+        return await _run_tool(
             _update_draft_impl, draft_id, text, preserve_embeds
         )
 
@@ -4429,7 +5095,7 @@ async def get_my_likes(
     recently liked old post won't appear in a windowed fetch.
     """
     async with _heartbeat(ctx):
-        return await asyncio.to_thread(
+        return await _run_tool(
             _get_my_likes_impl, limit, since_minutes, min_chars, quote
         )
 
@@ -4675,7 +5341,7 @@ async def get_conversations(
     unread_only: bool = False,
     kind: Literal["direct", "group"] | None = None,
     requests: bool = False,
-    limit: int = 30,
+    limit: Annotated[int, Field(ge=1, le=1000)] = 30,
     ctx: Context = None,
 ) -> str:
     """List direct-message conversations (1:1 DMs and group chats).
@@ -4689,31 +5355,46 @@ async def get_conversations(
             follow, instead of accepted convos.
     """
     async with _heartbeat(ctx):
-        return await asyncio.to_thread(_get_conversations_impl, unread_only, kind, requests, limit)
+        return await _run_tool(_get_conversations_impl, unread_only, kind, requests, limit)
 
 
 def _get_conversations_impl(unread_only, kind, requests, limit):
     dm = _dm()
     my_did = client.me.did
-    params = {"limit": min(max(limit, 1), 100)}
+    params = {}
     if unread_only:
         params["read_state"] = "unread"
     if kind:
         params["kind"] = kind
     if requests:
         params["status"] = "request"
-    convos = _dm_list_convos(dm, params)
+    convos, more = _dm_list_convos(dm, params, max(limit, 1))
     if not convos:
         return "No message requests." if requests else "No conversations."
     label = "message requests" if requests else "conversations"
     rows = [_render_convo_row(c, my_did) for c in convos]
     legend = 'cols: convo_id | direct @members or group "name" (N members) | unread N | muted | last message'
-    return f"{len(convos)} {label}\n{legend}\n" + "\n".join(rows)
+    footer = f"\n… more {label} exist; raise limit (max 1000) to see older ones." if more else ""
+    return f"{len(convos)} {label}\n{legend}\n" + "\n".join(rows) + footer
 
 
-def _dm_list_convos(dm, params):
-    resp = dm.list_convos(params)
-    return resp.convos or []
+def _dm_list_convos(dm, params, limit: int):
+    """Page through listConvos until `limit` convos. Returns (convos, more_exist)."""
+    convos: list = []
+    cursor = None
+    while len(convos) < limit:
+        _raise_if_cancelled()
+        page_params = dict(params, limit=min(100, limit - len(convos)))
+        if cursor:
+            page_params["cursor"] = cursor
+        resp = dm.list_convos(page_params)
+        page = resp.convos or []
+        convos.extend(page)
+        next_cursor = getattr(resp, "cursor", None)
+        if not page or not next_cursor or next_cursor == cursor:
+            return convos, False
+        cursor = next_cursor
+    return convos[:limit], True
 
 
 @mcp.tool(
@@ -4723,9 +5404,9 @@ def _dm_list_convos(dm, params):
 async def get_messages(
     convo_id: str,
     unread_only: bool = True,
-    context: int = 3,
-    limit: int = 30,
-    since_minutes: int | None = None,
+    context: Annotated[int, Field(ge=0, le=200)] = 3,
+    limit: Annotated[int, Field(ge=1, le=1000)] = 30,
+    since_minutes: Annotated[int | None, Field(ge=1)] = None,
     ctx: Context = None,
 ) -> str:
     """Read messages in a conversation (1:1 or group), oldest -> newest.
@@ -4743,7 +5424,7 @@ async def get_messages(
         since_minutes: Time bound when unread_only=False.
     """
     async with _heartbeat(ctx):
-        return await asyncio.to_thread(
+        return await _run_tool(
             _get_messages_impl, convo_id, unread_only, context, limit, since_minutes
         )
 
@@ -4833,7 +5514,7 @@ async def send_message(
     1000 graphemes.
     """
     async with _heartbeat(ctx):
-        return await asyncio.to_thread(_send_message_impl, text, convo_id, to_handle)
+        return await _run_tool(_send_message_impl, text, convo_id, to_handle)
 
 
 def _send_message_impl(text, convo_id, to_handle):
@@ -4868,7 +5549,7 @@ async def mark_read(
 ) -> str:
     """Mark a conversation read up to message_id, or the whole convo if omitted."""
     async with _heartbeat(ctx):
-        return await asyncio.to_thread(_mark_read_impl, convo_id, message_id)
+        return await _run_tool(_mark_read_impl, convo_id, message_id)
 
 
 def _mark_read_impl(convo_id, message_id):
@@ -4906,15 +5587,72 @@ class FixAcceptHeaderMiddleware:
 
 # --- Entry point ---
 
+def _is_loopback_host(host: str) -> bool:
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _check_auth_exposure(modes: list[str]) -> None:
+    """Refuse to serve DMs and write tools unauthenticated beyond loopback.
+
+    A warning is not enough: an env file that lost its auth settings would
+    otherwise publish the whole account on every interface. Set
+    MCP_ALLOW_UNAUTHENTICATED=1 to accept that deliberately (e.g. behind an
+    authenticating proxy on a private network).
+    """
+    if modes:
+        log.info("Auth: %s. MCP endpoint: http://%s:%d%s", " + ".join(modes), MCP_HOST, MCP_PORT, MCP_PATH)
+        return
+    if _is_loopback_host(MCP_HOST):
+        log.warning("No MCP_AUTH_TOKEN or GitHub OAuth configured — unauthenticated, "
+                    "but bound to loopback (%s) only.", MCP_HOST)
+        return
+    if os.getenv("MCP_ALLOW_UNAUTHENTICATED", "").lower() in ("1", "true", "yes"):
+        log.warning("No auth configured and bound to %s: anyone who can reach this port controls "
+                    "the account (MCP_ALLOW_UNAUTHENTICATED is set).", MCP_HOST)
+        return
+    raise SystemExit(
+        f"Refusing to start: no MCP_AUTH_TOKEN or GitHub OAuth is configured and MCP_HOST={MCP_HOST} "
+        "is not loopback. Configure auth, bind to 127.0.0.1, or set MCP_ALLOW_UNAUTHENTICATED=1."
+    )
+
+
+def _startup() -> None:
+    """Log in (bounded retries) and warm the name caches; neither failure is fatal.
+
+    A Bluesky outage at boot used to crash the process and leave systemd
+    re-running the whole login sequence. Now the server comes up regardless and
+    _SessionGuard retries the login (with backoff) on the next tool call.
+    """
+    _require_credentials()
+    for attempt in range(1, 4):
+        try:
+            _ensure_logged_in()
+            break
+        except Exception as exc:
+            log.warning("Startup login attempt %d/3 failed: %s", attempt, _brief_error(exc))
+            if attempt < 3:
+                time.sleep(max(0.0, _login_state["retry_at"] - time.monotonic()) or 5.0)
+    else:
+        log.error("Could not log in at startup; tool calls will keep retrying.")
+        return
+    try:
+        refresh_caches()
+    except Exception as exc:
+        log.warning("Feed/list names not loaded (%s); they load on first use.", _brief_error(exc))
+
+
 if __name__ == "__main__":
     import uvicorn
 
-    modes = [m for m, on in (("header token", MCP_AUTH_TOKEN), ("GitHub OAuth", GITHUB_CLIENT_ID)) if on]
-    if modes:
-        log.info("Auth: %s. MCP endpoint: http://%s:%d%s", " + ".join(modes), MCP_HOST, MCP_PORT, MCP_PATH)
-    else:
-        log.warning("No MCP_AUTH_TOKEN or GitHub OAuth configured — server is unauthenticated! "
-                    "Set them in .env for production use.")
+    _check_auth_exposure(
+        [m for m, on in (("header token", MCP_AUTH_TOKEN), ("GitHub OAuth", GITHUB_CLIENT_ID)) if on]
+    )
+    _startup()
 
     app = FixAcceptHeaderMiddleware(mcp.http_app(path=MCP_PATH))
     # ws="none": transport is streamable HTTP, so skip uvicorn's WebSocket

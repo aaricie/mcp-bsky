@@ -115,9 +115,24 @@ def gate(cands, *, min_coh=0.040, min_lift=3.0, min_bits=8.3, min_units=2,
     return out
 
 
+def candidate_matrix(cands, n_units):
+    """CSR (candidates x units) built straight from each mask's set bits.
+
+    Never materialises the dense float matrix: at 20k candidates x 12k units
+    that temporary alone would be ~960 MB.
+    """
+    cols = [np.flatnonzero(c["mask"]) for c in cands]
+    indptr = np.zeros(len(cands) + 1, dtype=np.int64)
+    if cols:
+        indptr[1:] = np.cumsum([len(c) for c in cols])
+    indices = (np.concatenate(cols) if cols else np.empty(0)).astype(np.int32)
+    data = np.ones(len(indices), dtype=np.float32)
+    return sp.csr_matrix((data, indices, indptr), shape=(len(cands), n_units))
+
+
 def choose(cands, uu, *, budget=None, max_entries=None, overlap=0.55,
            redundancy=0.10, min_new_mass=0.6, w_spec=1.0, min_rel_score=0.08,
-           per_entry_overhead=1, max_term_uses=2):
+           per_entry_overhead=1, max_term_uses=2, prefix_budget=None):
     """Greedy on *marginal* mass, so a story is named once rather than per facet.
 
     `min_rel_score` is a junk guard, not the main control: marginal value decays
@@ -136,6 +151,13 @@ def choose(cands, uu, *, budget=None, max_entries=None, overlap=0.55,
     postlists and the measured index carried ten lines for one jobs report
     ("jobs july", "graph jobs", "fox jobs", "jobs low", "economy jobs", ...).
     Capping reuse of the shared word spends those tokens on other discussions.
+
+    `budget` selects *under* the budget: unaffordable candidates are skipped at
+    every step, so the ranking itself depends on the budget and a larger one
+    can admit an expensive entry that crowds out a cheaper entry a smaller one
+    chose. `prefix_budget` instead ranks with no budget and stops at the first
+    entry that no longer fits, so the result for any budget is a prefix of the
+    result for every larger one — raising it only appends entries.
     """
     if not cands:
         return [], 0
@@ -156,7 +178,7 @@ def choose(cands, uu, *, budget=None, max_entries=None, overlap=0.55,
 
     # One sparse mat-vec per iteration instead of a Python loop over candidates.
     # At 72 h (12k units, 20k candidates) the loop version spent minutes here.
-    C = sp.csr_matrix(np.array([c["mask"] for c in cands], dtype=np.float32))
+    C = candidate_matrix(cands, n)
     cost_arr = np.array([c["cost"] for c in cands], dtype=np.float32)
 
     while alive.any():
@@ -180,6 +202,8 @@ def choose(cands, uu, *, budget=None, max_entries=None, overlap=0.55,
             continue
         if max_term_uses and any(term_uses.get(t, 0) >= max_term_uses for t in c["q"]):
             continue
+        if prefix_budget is not None and spent + c["cost"] + per_entry_overhead > prefix_budget:
+            break
         c = dict(c)
         c["marginal"] = best_s
         chosen.append(c)

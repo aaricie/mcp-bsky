@@ -18,8 +18,12 @@ import numpy as np
 
 class Coherence:
     def __init__(self, Mr: np.ndarray):
-        """Mr: (n_terms, n_units) bool over *rare subject terms only*."""
-        self.Mr = Mr.astype(np.float32)
+        """Mr: (n_terms, n_units) bool over *rare subject terms only*.
+
+        Kept as bool (a quarter of float32's footprint at index scale); score()
+        converts only the <= max_sample columns it compares.
+        """
+        self.Mr = Mr if Mr.dtype == bool else Mr.astype(bool)
         self.size = self.Mr.sum(0)
 
     def score(self, mask, exclude=(), max_sample=60, rng=None):
@@ -29,9 +33,8 @@ class Coherence:
         if idx.size > max_sample:
             rng = rng or np.random.default_rng(0)
             idx = rng.choice(idx, max_sample, replace=False)
-        X = self.Mr[:, idx]
+        X = self.Mr[:, idx].astype(np.float32)
         if exclude:
-            X = X.copy()
             X[list(exclude), :] = 0.0
         inter = X.T @ X
         sz = np.diag(inter)

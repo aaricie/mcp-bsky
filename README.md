@@ -95,7 +95,10 @@ http://localhost:8765/mcp
 | `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | for OAuth | — | Credentials of a GitHub OAuth app whose callback URL is `<MCP_PUBLIC_URL>/auth/callback`. |
 | `MCP_ALLOWED_GITHUB_IDS` | for OAuth | — | Comma-separated numeric GitHub user IDs allowed to sign in (`gh api user --jq .id`). |
 | `MCP_JWT_SIGNING_KEY` | no | derived | Signs the OAuth tokens the server issues. Set it so rotating the GitHub secret doesn't sign every client out. |
-| `MCP_RAW_OUTPUT_CHARS` | no | `72000` | Size cap for row-per-post output; posts past it are reported as not shown. |
+| `MCP_RAW_OUTPUT_CHARS` | no | `72000` | Size cap, in UTF-8 bytes, for row-per-post and thread output; posts past it are reported as not shown. |
+| `BSKY_SESSION_FILE` | no | `bsky_session.txt` | Where the Bluesky session is saved (mode 600) so restarts reuse it instead of logging in again. Empty disables. |
+| `MCP_POST_ID_REUSE_HOURS` | no | `24` | Post IDs stop resolving after 1 hour; their numbers go to a different post only after this many hours. |
+| `MCP_INDEX_CONCURRENCY` | no | `1` | How many `mode="index"` builds may run at once (each is memory-heavy). |
 
 `.env` is ignored by Git. Never commit your app password, MCP auth token, OAuth secrets, session tokens, SSH credentials, or reverse-proxy credentials.
 
@@ -106,7 +109,7 @@ The MCP endpoint is always `/mcp`; no credential is ever part of the URL. Config
 - **Bearer token** (`MCP_AUTH_TOKEN`) for clients that can send headers: Claude Code, Codex, scripts, bots.
 - **GitHub OAuth** (`MCP_PUBLIC_URL`, `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, `MCP_ALLOWED_GITHUB_IDS`) for connector clients that can't send headers, including ChatGPT and Claude apps. The server runs the OAuth flow itself, shows a consent screen, and admits only the GitHub accounts you list. It requests no GitHub scopes, so it learns who you are and nothing else.
 
-With neither configured, the server is unauthenticated and logs a warning at startup. That is only appropriate when it is bound to `127.0.0.1`.
+With neither configured, the server refuses to start unless `MCP_HOST` is a loopback address (or `MCP_ALLOW_UNAUTHENTICATED=1` is set deliberately).
 
 ## Connecting an MCP client
 
@@ -266,7 +269,7 @@ Link-card fetching includes a redirect-aware SSRF guard that rejects private, lo
 
 ## Development
 
-The main server is intentionally kept in `server.py`. The `_test_*.py` scripts are self-contained regression checks for selected rendering/parsing behavior and do not require deployment credentials.
+The main server is intentionally kept in `server.py`. The `_test_*.py` scripts are offline regression checks that import the real `server.py` (via `_test_support.py`) and need no credentials or network; `_test_review_fixes.py` covers the October 2026 review findings.
 
 Internal architecture notes for coding agents are in `AGENTS.md` and `CLAUDE.md`.
 
