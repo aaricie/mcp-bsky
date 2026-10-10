@@ -1,0 +1,24 @@
+# 4.x: MCP 2026-07-28 support, docstring Args -> parameter descriptions.
+# exclude_args is gone; server.py's _ClientArgShim middleware strips
+# `wait_for_previous` and folds hidden aliases before validation instead.
+# <5: re-verify that middleware (and output_schema=None) before a major
+# upgrade — undeclared arguments are rejected, so a broken shim fails every
+# call from clients that send wait_for_previous.
+fastmcp>=4.1,<5
+# >=0.0.72: current chat reply fields/open unions plus gallery post views.
+# Older SDKs either drop DM reply context or fail validation on newer embeds.
+atproto>=0.0.72
+httpx
+python-dotenv
+grapheme
+uvicorn
+
+# --- get_posts(mode="index"), i.e. the vendored comp/ package ---
+# tiktoken sizes index entries against their token cost; the rest is the
+# keyquery pipeline. wordfreq is technically optional (comp/vocab.py guards the
+# import) but without it non-English function words leak in as topic names.
+tiktoken
+pandas
+numpy
+scipy
+wordfreq

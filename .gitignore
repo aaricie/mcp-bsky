@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.claude/
+.pytest_cache/
+.ruff_cache/
+*.log
+*.db
+*.db-shm
+*.db-wal
+.env.local
+# Private deployment tooling and notes for the author's own server: kept
+# locally, never published.
+NUC.md
+bluesky-mcp-design.md
+_deploy.py
+_smoke.py
+_smoke_management.py
+_verify.py
+.env.local.example

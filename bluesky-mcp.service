@@ -1,0 +1,15 @@
+[Unit]
+Description=Bluesky MCP Server
+After=network.target
+
+[Service]
+Type=simple
+User=YOUR_USER
+WorkingDirectory=/path/to/bluesky-mcp
+EnvironmentFile=/path/to/bluesky-mcp/.env
+ExecStart=/path/to/venv/bin/python server.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
