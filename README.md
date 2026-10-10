@@ -104,7 +104,7 @@ http://localhost:8765/mcp
 The MCP endpoint is always `/mcp`; no credential is ever part of the URL. Configure one or both of:
 
 - **Bearer token** (`MCP_AUTH_TOKEN`) for clients that can send headers: Claude Code, Codex, scripts, bots.
-- **GitHub OAuth** (`MCP_PUBLIC_URL`, `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, `MCP_ALLOWED_GITHUB_IDS`) for connector clients that can't, such as claude.ai and the Claude apps. The server runs the OAuth flow itself, shows a consent screen, and admits only the GitHub accounts you list. It requests no GitHub scopes, so it learns who you are and nothing else.
+- **GitHub OAuth** (`MCP_PUBLIC_URL`, `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, `MCP_ALLOWED_GITHUB_IDS`) for connector clients that can't send headers, including ChatGPT and Claude apps. The server runs the OAuth flow itself, shows a consent screen, and admits only the GitHub accounts you list. It requests no GitHub scopes, so it learns who you are and nothing else.
 
 With neither configured, the server is unauthenticated and logs a warning at startup. That is only appropriate when it is bound to `127.0.0.1`.
 
@@ -141,6 +141,8 @@ bearer_token_env_var = "BSKY_MCP_TOKEN"
 ```
 
 **claude.ai / Claude apps** (OAuth): add a custom connector with the URL `https://mcp.example.com/mcp` and no credentials, approve the consent screen, then sign in with an allowed GitHub account.
+
+**ChatGPT** (OAuth): add a custom MCP server with the Server URL `https://mcp.example.com/mcp` and select OAuth. Leave the discovered authorization, token, registration, authorization-server, and resource URLs unchanged. ChatGPT registers its OAuth client with this server; its callback is either `https://chatgpt.com/connector/oauth/{callback_id}` or `https://chatgpt.com/connector_platform_oauth_redirect`. Both are allowed by the server. Copy the exact callback shown in ChatGPT's MCP management page if you need to inspect a failed registration. The GitHub OAuth app's callback remains `https://mcp.example.com/auth/callback`: it is a separate hop from the ChatGPT callback. Restart the deployed MCP service after changing the OAuth redirect allowlist.
 
 Client configuration formats differ, so consult the documentation for your MCP client if it uses different field names.
 

@@ -2231,11 +2231,12 @@ class _AllowlistedGitHubProvider(GitHubProvider):
         return result
 
 
-# Redirect URIs an OAuth client may register: claude.ai / Claude apps, and the
-# loopback callbacks of CLI clients (Claude Code, Codex). The consent screen
-# and the account allowlist are the main guards; this narrows phishing-style
-# registrations further.
+# Redirect URIs an OAuth client may register: ChatGPT, Claude apps, and the
+# loopback callbacks of CLI clients. The consent screen and account allowlist
+# are the main guards; this narrows phishing-style registrations further.
 _OAUTH_REDIRECT_PATTERNS = [
+    "https://chatgpt.com/connector/oauth/*",
+    "https://chatgpt.com/connector_platform_oauth_redirect",
     "https://claude.ai/*",
     "https://claude.com/*",
     "http://localhost:*",
